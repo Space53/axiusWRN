@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: axius-wrn
+    env: node
+    buildCommand: npm install
+    startCommand: node server.js
+    envVars:
+      - key: YANDEX_TOKEN
+        sync: false
