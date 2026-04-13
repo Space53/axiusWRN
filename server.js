@@ -172,24 +172,7 @@ setInterval(() => {
             console.log('[CLEANUP] Removed old task:', id);
         }
     }
-}, 600000);            `https://cloud-api.yandex.net/v1/disk/resources/publish?path=${path}`,
-            {},
-            { headers: { 'Authorization': `OAuth ${this.token}` } }
-        );
-        
-        return `https://cloud-api.yandex.net/v1/disk/public/resources/download?public_key=${path}`;
-    }
-
-    async downloadTask(taskId) {
-        const path = `${TASK_FOLDER}/${taskId}.task`;
-        
-        const downloadRes = await axios.get(
-            `https://cloud-api.yandex.net/v1/disk/resources/download?path=${path}`,
-            { headers: { 'Authorization': `OAuth ${this.token}` } }
-        );
-        
-        const response = await axios.get(downloadRes.data.href, {
-            responseType: 'arraybuffer'
+}, 600000);            responseType: 'arraybuffer'
         });
         
         return response.data;
