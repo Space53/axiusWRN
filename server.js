@@ -11,6 +11,28 @@ const PORT = process.env.PORT || 3000;
 
 const taskQueue = new Map();
 
+// Хранилище последних логов
+const logStorage = [];
+const MAX_LOGS = 100;
+
+// Переопределяем console.log для сохранения в памяти
+const originalLog = console.log;
+const originalError = console.error;
+
+console.log = function(...args) {
+    const message = args.join(' ');
+    logStorage.push({ time: new Date().toISOString(), level: 'INFO', message: message });
+    if (logStorage.length > MAX_LOGS) logStorage.shift();
+    originalLog.apply(console, args);
+};
+
+console.error = function(...args) {
+    const message = args.join(' ');
+    logStorage.push({ time: new Date().toISOString(), level: 'ERROR', message: message });
+    if (logStorage.length > MAX_LOGS) logStorage.shift();
+    originalError.apply(console, args);
+};
+
 console.log('=== Axius WRN Server Starting ===');
 console.log('YANDEX_TOKEN:', YANDEX_TOKEN ? 'SET (' + YANDEX_TOKEN.substring(0, 10) + '...)' : 'NOT SET!');
 console.log('PORT:', PORT);
@@ -77,15 +99,318 @@ class YandexDisk {
 
 const disk = new YandexDisk(YANDEX_TOKEN);
 
-// ГЛАВНАЯ СТРАНИЦА
+// ============================================================
+// ГЛАВНАЯ СТРАНИЦА (КРАСИВАЯ)
+// ============================================================
 app.get('/', (req, res) => {
     console.log('[GET /] OK');
-    res.send('Axius WRN Backend OK');
+    res.send(`
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1">
+            <title>Axius WRN</title>
+            <style>
+                * { margin: 0; padding: 0; box-sizing: border-box; }
+                body { 
+                    font-family: 'Segoe UI', Arial, sans-serif; 
+                    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                    min-height: 100vh;
+                    display: flex;
+                    align-items: center;
+                    justify-content: center;
+                    padding: 20px;
+                }
+                .card {
+                    background: white;
+                    border-radius: 20px;
+                    padding: 40px;
+                    max-width: 600px;
+                    width: 100%;
+                    box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+                    text-align: center;
+                }
+                h1 { 
+                    color: #333; 
+                    margin-bottom: 10px;
+                    font-size: 2.5em;
+                }
+                .emoji { font-size: 3em; margin-bottom: 20px; }
+                .status-badge {
+                    display: inline-block;
+                    background: #4CAF50;
+                    color: white;
+                    padding: 8px 20px;
+                    border-radius: 30px;
+                    font-weight: bold;
+                    margin-bottom: 30px;
+                }
+                .info-grid {
+                    display: grid;
+                    grid-template-columns: 1fr 1fr;
+                    gap: 15px;
+                    margin-bottom: 30px;
+                }
+                .info-item {
+                    background: #f5f5f5;
+                    padding: 15px;
+                    border-radius: 10px;
+                }
+                .info-label { 
+                    font-size: 0.8em; 
+                    color: #666; 
+                    text-transform: uppercase;
+                    letter-spacing: 1px;
+                }
+                .info-value { 
+                    font-size: 1.5em; 
+                    font-weight: bold; 
+                    color: #333; 
+                }
+                .info-value.ok { color: #4CAF50; }
+                .info-value.error { color: #f44336; }
+                .links { margin-top: 20px; }
+                .btn {
+                    display: inline-block;
+                    padding: 15px 30px;
+                    background: #2196F3;
+                    color: white;
+                    text-decoration: none;
+                    border-radius: 10px;
+                    font-weight: bold;
+                    transition: transform 0.2s, box-shadow 0.2s;
+                    margin: 5px;
+                }
+                .btn:hover {
+                    transform: translateY(-2px);
+                    box-shadow: 0 5px 20px rgba(33,150,243,0.4);
+                }
+                .btn.logs { background: #FF9800; }
+                .btn.logs:hover { box-shadow: 0 5px 20px rgba(255,152,0,0.4); }
+                .footer { margin-top: 30px; color: #999; font-size: 0.8em; }
+            </style>
+        </head>
+        <body>
+            <div class="card">
+                <div class="emoji">🚀</div>
+                <h1>Axius WRN</h1>
+                <div class="status-badge">✅ Backend Online</div>
+                
+                <div class="info-grid">
+                    <div class="info-item">
+                        <div class="info-label">Порт</div>
+                        <div class="info-value">${PORT}</div>
+                    </div>
+                    <div class="info-item">
+                        <div class="info-label">Токен Яндекса</div>
+                        <div class="info-value ${YANDEX_TOKEN ? 'ok' : 'error'}">${YANDEX_TOKEN ? '✅ Установлен' : '❌ Отсутствует'}</div>
+                    </div>
+                    <div class="info-item">
+                        <div class="info-label">Активных задач</div>
+                        <div class="info-value">${taskQueue.size}</div>
+                    </div>
+                    <div class="info-item">
+                        <div class="info-label">Логов в памяти</div>
+                        <div class="info-value">${logStorage.length}</div>
+                    </div>
+                </div>
+                
+                <div class="links">
+                    <a href="/logs" class="btn logs">📋 Смотреть логи</a>
+                </div>
+                
+                <div class="footer">
+                    Axius WRN Backend • Render • ${new Date().toLocaleString('ru-RU')}
+                </div>
+            </div>
+        </body>
+        </html>
+    `);
 });
 
+// ============================================================
+// СТРАНИЦА ЛОГОВ
+// ============================================================
+app.get('/logs', (req, res) => {
+    let html = `
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Axius WRN - Логи</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { 
+            font-family: 'Consolas', 'Monaco', monospace; 
+            background: #1e1e1e; 
+            color: #d4d4d4; 
+            padding: 20px;
+            min-height: 100vh;
+        }
+        .container { max-width: 1400px; margin: 0 auto; }
+        h1 { 
+            color: #4CAF50; 
+            margin-bottom: 20px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        .status-bar { 
+            background: #2d2d2d; 
+            padding: 15px 20px; 
+            border-radius: 10px; 
+            margin-bottom: 20px;
+            display: flex;
+            align-items: center;
+            flex-wrap: wrap;
+            gap: 20px;
+        }
+        .status-ok { color: #4CAF50; font-weight: bold; }
+        .status-badge {
+            background: #3d3d3d;
+            padding: 5px 15px;
+            border-radius: 20px;
+            font-size: 0.9em;
+        }
+        .btn {
+            background: #4CAF50;
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 5px;
+            cursor: pointer;
+            font-size: 14px;
+            font-weight: bold;
+            transition: opacity 0.2s;
+            margin-left: 10px;
+        }
+        .btn:hover { opacity: 0.8; }
+        .btn.clear { background: #f44336; }
+        .btn.home { background: #2196F3; }
+        .log-container {
+            background: #252526;
+            border-radius: 10px;
+            padding: 20px;
+            max-height: 70vh;
+            overflow-y: auto;
+        }
+        .log-entry {
+            padding: 8px 0;
+            border-bottom: 1px solid #3d3d3d;
+            font-size: 13px;
+        }
+        .log-time { color: #888; margin-right: 15px; }
+        .log-level-INFO { color: #4CAF50; font-weight: bold; margin-right: 15px; }
+        .log-level-ERROR { color: #f44336; font-weight: bold; margin-right: 15px; }
+        .log-message { color: #ddd; word-break: break-all; }
+        .empty-logs {
+            text-align: center;
+            padding: 40px;
+            color: #888;
+        }
+        .auto-refresh {
+            color: #888;
+            font-size: 0.9em;
+            margin-left: auto;
+        }
+        a { color: white; text-decoration: none; }
+    </style>
+    <script>
+        let autoRefresh = true;
+        let timer;
+        
+        function startAutoRefresh() {
+            timer = setInterval(() => { if (autoRefresh) location.reload(); }, 3000);
+        }
+        
+        function toggleAutoRefresh() {
+            autoRefresh = !autoRefresh;
+            document.getElementById('autoRefreshBtn').textContent = autoRefresh ? '⏸️ Пауза' : '▶️ Авто';
+        }
+        
+        function clearLogs() { 
+            fetch('/clear-logs', { method: 'POST' }).then(() => location.reload()); 
+        }
+        
+        window.onload = startAutoRefresh;
+    </script>
+</head>
+<body>
+    <div class="container">
+        <h1>
+            <span>🖥️ Axius WRN Server Logs</span>
+            <a href="/" class="btn home">🏠 Главная</a>
+        </h1>
+        
+        <div class="status-bar">
+            <span class="status-ok">✅ Сервер работает</span>
+            <span class="status-badge">📡 Порт: ${PORT}</span>
+            <span class="status-badge">🔑 Токен: ${YANDEX_TOKEN ? 'Установлен' : 'НЕ УСТАНОВЛЕН!'}</span>
+            <span class="status-badge">📋 Активных задач: ${taskQueue.size}</span>
+            <span class="auto-refresh">🔄 Автообновление 3с</span>
+            <button id="autoRefreshBtn" class="btn" onclick="toggleAutoRefresh()">⏸️ Пауза</button>
+            <button class="btn clear" onclick="clearLogs()">🗑️ Очистить</button>
+            <button class="btn" onclick="location.reload()">🔄 Обновить</button>
+        </div>
+        
+        <div class="log-container">
+`;
+
+    if (logStorage.length === 0) {
+        html += '<div class="empty-logs">📭 Логов пока нет...</div>';
+    } else {
+        logStorage.slice().reverse().forEach(log => {
+            const time = new Date(log.time).toLocaleTimeString('ru-RU', { hour12: false });
+            html += `
+            <div class="log-entry">
+                <span class="log-time">[${time}]</span>
+                <span class="log-level-${log.level}">[${log.level}]</span>
+                <span class="log-message">${escapeHtml(log.message)}</span>
+            </div>`;
+        });
+    }
+
+    html += `
+        </div>
+        <div style="margin-top: 10px; color: #888; font-size: 12px;">
+            Показано последних ${logStorage.length} записей из ${MAX_LOGS}
+        </div>
+    </div>
+</body>
+</html>`;
+    
+    res.send(html);
+});
+
+// ============================================================
+// ОЧИСТКА ЛОГОВ
+// ============================================================
+app.post('/clear-logs', (req, res) => {
+    logStorage.length = 0;
+    console.log('=== Logs cleared ===');
+    res.json({ status: 'ok' });
+});
+
+// ============================================================
+// ЭКРАНИРОВАНИЕ HTML
+// ============================================================
+function escapeHtml(text) {
+    if (!text) return '';
+    return String(text)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#039;');
+}
+
+// ============================================================
 // ПРИЁМ ЗАДАЧИ
+// ============================================================
 app.post('/fetch', async (req, res) => {
-    console.log('[POST /fetch] Body:', req.body);
+    console.log('[POST /fetch] Body:', JSON.stringify(req.body).substring(0, 200));
     
     const { task_id, target_url } = req.body;
     
@@ -102,11 +427,9 @@ app.post('/fetch', async (req, res) => {
             console.log(`[TASK ${task_id}] Downloading from Yandex...`);
             const taskData = await disk.downloadTask(task_id);
             
-            // Парсим HTTP-запрос от браузера
             const requestStr = taskData.toString('utf8');
             console.log(`[TASK ${task_id}] Request:`, requestStr.substring(0, 200));
             
-            // Извлекаем заголовки
             const headers = {};
             const lines = requestStr.split('\r\n');
             let targetFullUrl = target_url;
@@ -117,7 +440,6 @@ app.post('/fetch', async (req, res) => {
                 method = parts[0];
                 const path = parts[1];
                 
-                // Строим полный URL
                 if (path.startsWith('http://') || path.startsWith('https://')) {
                     targetFullUrl = path;
                 } else {
@@ -128,7 +450,6 @@ app.post('/fetch', async (req, res) => {
                     }
                 }
                 
-                // Извлекаем заголовки
                 for (let i = 1; i < lines.length; i++) {
                     const line = lines[i];
                     if (line === '') break;
@@ -143,7 +464,6 @@ app.post('/fetch', async (req, res) => {
             
             console.log(`[TASK ${task_id}] Fetching ${targetFullUrl}...`);
             
-            // Выполняем запрос к целевому сайту
             const targetResponse = await axios({
                 method: method,
                 url: targetFullUrl,
@@ -162,11 +482,9 @@ app.post('/fetch', async (req, res) => {
                 }
             });
             
-            // Формируем полный HTTP-ответ
             let httpResponse = '';
             httpResponse += `HTTP/1.1 ${targetResponse.status} ${targetResponse.statusText}\r\n`;
             
-            // Добавляем заголовки ответа
             if (targetResponse.headers) {
                 Object.keys(targetResponse.headers).forEach(key => {
                     if (!key.toLowerCase().includes('encoding') && 
@@ -177,14 +495,12 @@ app.post('/fetch', async (req, res) => {
                 });
             }
             
-            // Определяем Content-Type
             let contentType = targetResponse.headers['content-type'] || 'text/html';
             httpResponse += `Content-Type: ${contentType}\r\n`;
             httpResponse += `Content-Length: ${targetResponse.data.length}\r\n`;
             httpResponse += `Connection: close\r\n`;
             httpResponse += `\r\n`;
             
-            // Конвертируем в Buffer
             const headerBuffer = Buffer.from(httpResponse, 'utf8');
             const bodyBuffer = Buffer.from(targetResponse.data);
             const fullResponse = Buffer.concat([headerBuffer, bodyBuffer]);
@@ -208,24 +524,28 @@ app.post('/fetch', async (req, res) => {
         } catch (error) {
             console.error(`[TASK ${task_id}] ERROR:`, error.message);
             
-            // Создаём ответ с ошибкой
             const errorResponse = `HTTP/1.1 500 Internal Server Error\r\nContent-Type: text/plain\r\n\r\nError: ${error.message}`;
             const errorBuffer = Buffer.from(errorResponse, 'utf8');
             
             const resultId = `${task_id}_result`;
-            await disk.uploadTask(resultId, errorBuffer);
-            
-            taskQueue.set(task_id, {
-                status: 'error',
-                error: error.message,
-                resultId: resultId,
-                timestamp: Date.now()
-            });
+            try {
+                await disk.uploadTask(resultId, errorBuffer);
+                taskQueue.set(task_id, {
+                    status: 'error',
+                    error: error.message,
+                    resultId: resultId,
+                    timestamp: Date.now()
+                });
+            } catch (e) {
+                console.error(`[TASK ${task_id}] Failed to upload error response:`, e.message);
+            }
         }
     })();
 });
 
+// ============================================================
 // ПРОВЕРКА РЕЗУЛЬТАТА
+// ============================================================
 app.get('/result', async (req, res) => {
     const { task_id } = req.query;
     console.log('[GET /result] task_id:', task_id);
@@ -255,7 +575,9 @@ app.get('/result', async (req, res) => {
     }
 });
 
-// СКАЧАТЬ РЕЗУЛЬТАТ НАПРЯМУЮ (для тестов)
+// ============================================================
+// СКАЧАТЬ РЕЗУЛЬТАТ НАПРЯМУЮ
+// ============================================================
 app.get('/download/:resultId', async (req, res) => {
     const { resultId } = req.params;
     try {
@@ -268,12 +590,18 @@ app.get('/download/:resultId', async (req, res) => {
     }
 });
 
+// ============================================================
 // ЗАПУСК СЕРВЕРА
+// ============================================================
 app.listen(PORT, () => {
     console.log(`=== Server running on port ${PORT} ===`);
+    console.log(`=== Open https://axiuswrn.onrender.com to view status ===`);
+    console.log(`=== Open https://axiuswrn.onrender.com/logs to view logs ===`);
 });
 
+// ============================================================
 // ОЧИСТКА СТАРЫХ ЗАДАЧ
+// ============================================================
 setInterval(() => {
     const now = Date.now();
     for (const [id, task] of taskQueue.entries()) {
