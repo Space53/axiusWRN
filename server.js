@@ -3,6 +3,7 @@ const axios = require('axios');
 const app = express();
 
 app.use(express.json({ limit: '50mb' }));
+app.use(express.text({ type: 'text/plain', limit: '10mb' }));
 
 const YANDEX_TOKEN = process.env.YANDEX_TOKEN;
 const TASK_FOLDER = 'app:/tasks';
@@ -16,19 +17,13 @@ class YandexDisk {
         this.token = token;
     }
 
-    async listFiles(prefix) {
-        const url = `https://cloud-api.yandex.net/v1/disk/resources?path=${TASK_FOLDER}&limit=100`;
-        const response = await axios.get(url, {
-            headers: { 'Authorization': `OAuth ${this.token}` }
-        });
-        const items = response.data._embedded.items || [];
-        return items.filter(f => f.name.startsWith(prefix));
-    }
-
     async fileExists(path) {
         try {
             const url = `https://cloud-api.yandex.net/v1/disk/resources?path=${path}`;
-            await axios.get(url, { headers: { 'Authorization': `OAuth ${this.token}` } });
+            await axios.get(url, { 
+                headers: { 'Authorization': `OAuth ${this.token}` },
+                timeout: 5000
+            });
             return true;
         } catch (e) {
             return false;
@@ -67,14 +62,17 @@ class YandexDisk {
         } catch (e) {}
     }
 
-    async ensureFolder() {
+    async listTaskFiles() {
         try {
-            await axios.put(
-                `https://cloud-api.yandex.net/v1/disk/resources?path=${TASK_FOLDER}`,
-                {},
-                { headers: { 'Authorization': `OAuth ${this.token}` } }
-            );
-        } catch (e) {}
+            const url = `https://cloud-api.yandex.net/v1/disk/resources?path=${TASK_FOLDER}&limit=100`;
+            const response = await axios.get(url, {
+                headers: { 'Authorization': `OAuth ${this.token}` }
+            });
+            const items = response.data._embedded?.items || [];
+            return items.filter(f => f.name.endsWith('.task'));
+        } catch (e) {
+            return [];
+        }
     }
 }
 
@@ -87,161 +85,18 @@ function urlToFilename(url) {
         .substring(0, 50);
 }
 
-async function processTask(taskFile) {
-    const taskName = taskFile.name;
-    const baseName = taskName.replace('.task', '');
-    const taskPath = `${TASK_FOLDER}/${taskName}`;
-    const processingPath = `${TASK_FOLDER}/${baseName}.processing`;
-    const resultPath = `${TASK_FOLDER}/${baseName}.html`;
-
-    console.log('[Worker] Processing:', baseName);
-
-    try {
-        // Создаём .processing
-        await disk.writeFile(processingPath, Buffer.from(`Processing started at ${new Date().toISOString()}`));
-
-        // Читаем URL из .task
-        const taskData = await disk.readFile(taskPath);
-        const url = taskData.toString('utf8').trim();
-
-        console.log('[Worker] Fetching:', url);
-
-        // Выполняем запрос
-        const response = await axios.get(url, {
-            responseType: 'arraybuffer',
-            timeout: 30000,
-            maxRedirects: 5,
-            headers: { 'User-Agent': 'Mozilla/5.0' }
-        });
-
-        // Сохраняем результат
-        await disk.writeFile(resultPath, Buffer.from(response.data));
-
-        // Удаляем .task и .processing
-        await disk.deleteFile(taskPath);
-        await disk.deleteFile(processingPath);
-
-        console.log('[Worker] Completed:', baseName, 'size:', response.data.length);
-
-    } catch (error) {
-        console.error('[Worker] Error:', baseName, error.message);
-
-        // Сохраняем ошибку
-        const errorHtml = `<html><body><h1>Error</h1><p>${error.message}</p></body></html>`;
-        await disk.writeFile(resultPath, Buffer.from(errorHtml));
-
-        await disk.deleteFile(taskPath);
-        await disk.deleteFile(processingPath);
-    }
-}
-
-async function workerLoop() {
-    await disk.ensureFolder();
-
-    while (true) {
-        try {
-            const files = await disk.listFiles('');
-            const taskFiles = files.filter(f => f.name.endsWith('.task'));
-
-            for (const taskFile of taskFiles) {
-                const baseName = taskFile.name.replace('.task', '');
-                const processingPath = `${TASK_FOLDER}/${baseName}.processing`;
-                const resultPath = `${TASK_FOLDER}/${baseName}.html`;
-
-                const hasProcessing = files.some(f => f.name === baseName + '.processing');
-                const hasResult = files.some(f => f.name === baseName + '.html');
-
-                if (!hasProcessing && !hasResult) {
-                    await processTask(taskFile);
-                }
-            }
-
-            // Очистка старых .html (старше 5 минут)
-            const now = Date.now();
-            for (const file of files) {
-                if (file.name.endsWith('.html')) {
-                    const modified = new Date(file.modified).getTime();
-                    if (now - modified > 300000) {
-                        await disk.deleteFile(`${TASK_FOLDER}/${file.name}`);
-                        console.log('[Cleanup] Deleted old:', file.name);
-                    }
-                }
-            }
-
-        } catch (error) {
-            console.error('[Worker] Loop error:', error.message);
-        }
-
-        await new Promise(resolve => setTimeout(resolve, 2000));
-    }
-}
-
-// Запускаем воркер
-workerLoop().catch(console.error);
-
-// API для устройства
-app.get('/check/:url', async (req, res) => {
-    const url = req.params.url;
-    const filename = urlToFilename(url);
-    const htmlPath = `${TASK_FOLDER}/${filename}.html`;
-    const taskPath = `${TASK_FOLDER}/${filename}.task`;
-    const processingPath = `${TASK_FOLDER}/${filename}.processing`;
-
-    const exists = await disk.fileExists(htmlPath);
-    const isProcessing = await disk.fileExists(processingPath);
-    const hasTask = await disk.fileExists(taskPath);
-
-    res.json({
-        exists: exists,
-        processing: isProcessing,
-        queued: hasTask
-    });
-});
-
-app.post('/request', express.text(), async (req, res) => {
-    const url = req.body.trim();
-    const filename = urlToFilename(url);
-    const taskPath = `${TASK_FOLDER}/${filename}.task`;
-
-    await disk.ensureFolder();
-    await disk.writeFile(taskPath, Buffer.from(url));
-
-    console.log('[API] Task created:', filename);
-    res.json({ status: 'queued', filename: filename });
-});
-
-app.get('/download/:filename', async (req, res) => {
-    const filename = req.params.filename;
-    const htmlPath = `${TASK_FOLDER}/${filename}.html`;
-
-    try {
-        const data = await disk.readFile(htmlPath);
-        res.set('Content-Type', 'text/html; charset=utf-8');
-        res.send(data);
-    } catch (error) {
-        res.status(404).send('Not found');
-    }
-});
-
-app.delete('/delete/:filename', async (req, res) => {
-    const filename = req.params.filename;
-    const htmlPath = `${TASK_FOLDER}/${filename}.html`;
-
-    await disk.deleteFile(htmlPath);
-    res.json({ status: 'deleted' });
-});
-
+// Главная страница
 app.get('/', (req, res) => {
     res.send(`
         <!DOCTYPE html>
         <html>
         <head>
             <meta charset="UTF-8">
-            <title>Axius WRN Cache</title>
+            <title>Axius WRN</title>
             <style>
-                body { font-family: Arial; padding: 50px; text-align: center; }
+                body { font-family: Arial; padding: 50px; text-align: center; background: #f5f5f5; }
                 h1 { color: #4CAF50; }
-                .status { background: #f5f5f5; padding: 20px; border-radius: 10px; }
+                .status { background: white; padding: 20px; border-radius: 10px; max-width: 400px; margin: 20px auto; }
             </style>
         </head>
         <body>
@@ -256,6 +111,132 @@ app.get('/', (req, res) => {
     `);
 });
 
+// Проверить наличие кэша
+app.get('/check/:url', async (req, res) => {
+    try {
+        const url = decodeURIComponent(req.params.url);
+        const filename = urlToFilename(url);
+        const htmlPath = `${TASK_FOLDER}/${filename}.html`;
+        const taskPath = `${TASK_FOLDER}/${filename}.task`;
+        const processingPath = `${TASK_FOLDER}/${filename}.processing`;
+
+        const exists = await disk.fileExists(htmlPath);
+        const processing = await disk.fileExists(processingPath);
+        const queued = await disk.fileExists(taskPath);
+
+        res.json({ exists, processing, queued });
+    } catch (e) {
+        res.json({ exists: false, processing: false, queued: false, error: e.message });
+    }
+});
+
+// Создать задачу
+app.post('/request', async (req, res) => {
+    try {
+        const url = req.body.trim();
+        if (!url.startsWith('http')) {
+            return res.status(400).json({ error: 'Invalid URL' });
+        }
+
+        const filename = urlToFilename(url);
+        const taskPath = `${TASK_FOLDER}/${filename}.task`;
+
+        await disk.writeFile(taskPath, Buffer.from(url));
+        console.log('[API] Task created:', filename);
+
+        res.json({ status: 'queued', filename: filename });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+// Скачать результат
+app.get('/download/:filename', async (req, res) => {
+    try {
+        const filename = req.params.filename;
+        const htmlPath = `${TASK_FOLDER}/${filename}`;
+
+        const data = await disk.readFile(htmlPath);
+        res.set('Content-Type', 'text/html; charset=utf-8');
+        res.send(data);
+    } catch (e) {
+        res.status(404).send('Not found');
+    }
+});
+
+// Запуск сервера
 app.listen(PORT, () => {
     console.log(`=== Server running on port ${PORT} ===`);
 });
+
+// Воркер для обработки задач (запускается каждые 3 секунды)
+async function processTasks() {
+    try {
+        const taskFiles = await disk.listTaskFiles();
+        
+        for (const taskFile of taskFiles) {
+            const taskName = taskFile.name;
+            const baseName = taskName.replace('.task', '');
+            const taskPath = `${TASK_FOLDER}/${taskName}`;
+            const processingPath = `${TASK_FOLDER}/${baseName}.processing`;
+            const resultPath = `${TASK_FOLDER}/${baseName}.html`;
+
+            // Пропускаем если уже обрабатывается
+            const isProcessing = await disk.fileExists(processingPath);
+            if (isProcessing) continue;
+
+            console.log('[Worker] Processing:', baseName);
+
+            try {
+                // Читаем URL
+                const taskData = await disk.readFile(taskPath);
+                const url = taskData.toString('utf8').trim();
+
+                if (!url.startsWith('http')) {
+                    throw new Error('Invalid URL: ' + url);
+                }
+
+                // Создаём .processing
+                await disk.writeFile(processingPath, Buffer.from('processing'));
+
+                console.log('[Worker] Fetching:', url);
+
+                // Выполняем запрос
+                const response = await axios.get(url, {
+                    responseType: 'arraybuffer',
+                    timeout: 30000,
+                    maxRedirects: 5,
+                    headers: { 'User-Agent': 'Mozilla/5.0' }
+                });
+
+                // Сохраняем результат
+                await disk.writeFile(resultPath, Buffer.from(response.data));
+
+                // Удаляем .task и .processing
+                await disk.deleteFile(taskPath);
+                await disk.deleteFile(processingPath);
+
+                console.log('[Worker] Completed:', baseName, 'size:', response.data.length);
+
+            } catch (error) {
+                console.error('[Worker] Error:', baseName, error.message);
+
+                // Сохраняем ошибку
+                const errorHtml = `<html><body><h1>Error</h1><p>${error.message}</p></body></html>`;
+                await disk.writeFile(resultPath, Buffer.from(errorHtml));
+
+                // Удаляем .task и .processing
+                await disk.deleteFile(taskPath);
+                await disk.deleteFile(processingPath);
+            }
+        }
+    } catch (error) {
+        console.error('[Worker] Loop error:', error.message);
+    }
+}
+
+// Запускаем воркер каждые 3 секунды
+setInterval(processTasks, 3000);
+processTasks(); // Первый запуск сразу
+
+console.log('=== Worker started ===');
