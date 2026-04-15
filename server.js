@@ -1,5 +1,6 @@
 const express = require('express');
 const axios = require('axios');
+const puppeteer = require('puppeteer');
 const app = express();
 
 app.use(express.json({ limit: '50mb' }));
@@ -16,9 +17,8 @@ function log(msg) {
     if (logs.length > 50) logs.shift();
 }
 
-log('=== Axius WRN Server Starting ===');
+log('=== Axius WRN Server with Puppeteer ===');
 log('TOKEN: ' + (YANDEX_TOKEN ? 'SET' : 'NOT SET'));
-log('TASK_FOLDER: ' + TASK_FOLDER);
 
 class YandexDisk {
     constructor(token) {
@@ -31,12 +31,9 @@ class YandexDisk {
                 headers: { 'Authorization': `OAuth ${this.token}` }
             });
             const items = res.data._embedded?.items || [];
-            // ВАЖНО: только .task, НЕ _result.task
             const tasks = items.filter(f => f.name.endsWith('.task') && !f.name.includes('_result'));
-            log('[Disk] Found ' + tasks.length + ' tasks');
             return tasks;
         } catch (e) {
-            log('[Disk] ERROR: ' + e.message);
             return [];
         }
     }
@@ -67,54 +64,116 @@ class YandexDisk {
             log('[Disk] Deleted: ' + path.split('/').pop());
         } catch (e) {}
     }
-
-    async fileExists(path) {
-        try {
-            await axios.get(`https://cloud-api.yandex.net/v1/disk/resources?path=${path}`, {
-                headers: { 'Authorization': `OAuth ${this.token}` }
-            });
-            return true;
-        } catch { return false; }
-    }
 }
 
 const disk = new YandexDisk(YANDEX_TOKEN);
 
-// ============ ЭНДПОИНТЫ ============
+// Запускаем браузер один раз при старте
+let browser = null;
 
+async function getBrowser() {
+    if (browser) return browser;
+    
+    log('[Puppeteer] Launching browser...');
+    browser = await puppeteer.launch({
+        headless: 'new',
+        args: [
+            '--no-sandbox',
+            '--disable-setuid-sandbox',
+            '--disable-dev-shm-usage',
+            '--disable-gpu',
+            '--disable-web-security',
+            '--disable-features=IsolateOrigins,site-per-process',
+            '--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        ]
+    });
+    log('[Puppeteer] Browser launched');
+    return browser;
+}
+
+async function fetchWithPuppeteer(url) {
+    const browser = await getBrowser();
+    const page = await browser.newPage();
+    
+    try {
+        log('[Puppeteer] Navigating to: ' + url);
+        
+        // Устанавливаем таймауты
+        await page.setDefaultNavigationTimeout(60000);
+        await page.setDefaultTimeout(60000);
+        
+        // Перехватываем запросы, чтобы ускорить загрузку (блокируем ненужное)
+        await page.setRequestInterception(true);
+        page.on('request', (req) => {
+            const resourceType = req.resourceType();
+            const reqUrl = req.url();
+            
+            // Блокируем рекламу, аналитику, шрифты (для скорости)
+            if (reqUrl.includes('google-analytics') ||
+                reqUrl.includes('doubleclick') ||
+                reqUrl.includes('googlesyndication') ||
+                reqUrl.includes('googletagmanager') ||
+                resourceType === 'font' ||
+                resourceType === 'media') {
+                req.abort();
+            } else {
+                req.continue();
+            }
+        });
+        
+        // Переходим на страницу
+        await page.goto(url, { 
+            waitUntil: 'networkidle2', // Ждём, пока не будет 2 сетевых запросов за 500мс
+            timeout: 60000 
+        });
+        
+        // Дополнительное ожидание для SPA
+        await page.waitForTimeout(3000);
+        
+        // Прокручиваем страницу для ленивой загрузки
+        await page.evaluate(async () => {
+            await new Promise((resolve) => {
+                let totalHeight = 0;
+                const distance = 300;
+                const timer = setInterval(() => {
+                    const scrollHeight = document.body.scrollHeight;
+                    window.scrollBy(0, distance);
+                    totalHeight += distance;
+                    
+                    if (totalHeight >= scrollHeight * 2) {
+                        clearInterval(timer);
+                        resolve();
+                    }
+                }, 100);
+            });
+        });
+        
+        // Ждём ещё немного
+        await page.waitForTimeout(2000);
+        
+        // Получаем HTML
+        const html = await page.content();
+        log('[Puppeteer] Done: ' + html.length + ' bytes');
+        
+        await page.close();
+        return html;
+        
+    } catch (error) {
+        log('[Puppeteer] Error: ' + error.message);
+        await page.close();
+        throw error;
+    }
+}
+
+// Главная страница с логами
 app.get('/', (req, res) => {
-    let html = '<h1>Axius WRN Server</h1><pre>';
+    let html = '<h1>Axius WRN Server (Puppeteer)</h1><pre>';
     logs.slice().reverse().forEach(l => html += l + '\n');
     html += '</pre>';
     res.send(html);
 });
 
-app.post('/fetch', async (req, res) => {
-    const { task_id, target_url } = req.body;
-    log('[API] /fetch: ' + task_id);
-    
-    if (!task_id || !target_url) {
-        return res.status(400).json({ error: 'Missing fields' });
-    }
-    
-    res.status(202).json({ status: 'queued', task_id });
-});
-
-app.get('/result', async (req, res) => {
-    const { task_id } = req.query;
-    
-    const resultPath = `${TASK_FOLDER}/${task_id}_result.task`;
-    const exists = await disk.fileExists(resultPath);
-    
-    if (exists) {
-        res.json({ status: 'done', result_id: task_id + '_result' });
-    } else {
-        res.json({ status: 'processing' });
-    }
-});
-
-// ============ ВОРКЕР ============
-
+// Обработка задач
 async function processTask(taskFile) {
     const taskName = taskFile.name;
     const taskPath = `${TASK_FOLDER}/${taskName}`;
@@ -135,42 +194,18 @@ async function processTask(taskFile) {
             url = parts[1];
         }
         
-        let host = '';
-        for (const line of lines) {
-            if (line.toLowerCase().startsWith('host:')) {
-                host = line.substring(5).trim();
-                break;
-            }
-        }
+        log('[Worker] Fetching with Puppeteer: ' + url);
         
-        if (!url.startsWith('http')) {
-            url = 'https://' + host + url;
-        }
-        
-        log('[Worker] Fetching: ' + url);
-        
-        const response = await axios.get(url, {
-            responseType: 'arraybuffer',
-            timeout: 30000,
-            maxRedirects: 5,
-            headers: { 'User-Agent': 'Mozilla/5.0' }
-        });
-        
-        log('[Worker] Response: ' + response.status + ', ' + response.data.length + ' bytes');
+        // Используем Puppeteer для полной загрузки
+        const html = await fetchWithPuppeteer(url);
         
         // Формируем HTTP-ответ
-        let httpResponse = `HTTP/1.1 ${response.status} OK\r\n`;
-        httpResponse += `Content-Type: text/html\r\n`;
-        httpResponse += `Content-Length: ${response.data.length}\r\n\r\n`;
+        const httpResponse = `HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: ${html.length}\r\n\r\n${html}`;
         
-        const header = Buffer.from(httpResponse, 'utf8');
-        const body = Buffer.from(response.data);
-        const full = Buffer.concat([header, body]);
-        
-        await disk.writeFile(resultPath, full);
+        await disk.writeFile(resultPath, Buffer.from(httpResponse));
         await disk.deleteFile(taskPath);
         
-        log('[Worker] DONE: ' + taskName);
+        log('[Worker] DONE: ' + taskName + ' (' + html.length + ' bytes)');
         
     } catch (e) {
         log('[Worker] ERROR: ' + e.message);
