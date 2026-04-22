@@ -1,12 +1,20 @@
 const express = require('express');
+const session = require('express-session');
 const { exec } = require('child_process');
 const fs = require('fs');
 const app = express();
 
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
+app.use(session({
+    secret: 'axius-secret',
+    resave: false,
+    saveUninitialized: false
+}));
 
 const PORT = process.env.PORT || 3000;
+const YANDEX_TOKEN = process.env.YANDEX_TOKEN || '';
+const TASK_FOLDER = 'app:/tasks';
 
 // Логи
 const logs = [];
@@ -14,18 +22,19 @@ function log(msg) {
     const entry = `[${new Date().toLocaleTimeString()}] ${msg}`;
     console.log(entry);
     logs.push(entry);
+    if (logs.length > 200) logs.shift();
 }
 
-log('Server started');
+// Пользователи
+const users = { 'admin': { password: 'admin123', sites: [] } };
 
-// ============ PHP БРАУЗЕР ЧЕРЕЗ NODE.JS ============
+// ============ НОВЫЙ PHP БРАУЗЕР (НЕ ЛОМАЕТ СТАРЫЙ КОД) ============
 app.get('/php-browser', (req, res) => {
     const url = req.query.url;
     if (!url) return res.status(400).send('URL required');
     
     log(`PHP Browser: ${url}`);
     
-    // PHP скрипт как строка
     const phpCode = `<?php
         $url = '${url}';
         
@@ -53,13 +62,10 @@ app.get('/php-browser', (req, res) => {
         echo $html;
     ?>`;
     
-    // Сохраняем во временный файл
     const phpFile = `/tmp/browser_${Date.now()}.php`;
     fs.writeFileSync(phpFile, phpCode);
     
-    // Запускаем PHP
     exec(`php ${phpFile}`, (error, stdout, stderr) => {
-        // Удаляем временный файл
         fs.unlinkSync(phpFile);
         
         if (error) {
@@ -71,7 +77,7 @@ app.get('/php-browser', (req, res) => {
     });
 });
 
-// ============ СТАРЫЙ API ============
+// ============ СТАРЫЙ КОД (НЕ ТРОГАЕМ) ============
 app.post('/fetch', (req, res) => {
     const { task_id, target_url } = req.body;
     log(`/fetch: ${task_id}`);
@@ -82,14 +88,33 @@ app.get('/result', (req, res) => {
     res.json({ status: 'processing' });
 });
 
-// ============ ГЛАВНАЯ ============
-app.get('/', (req, res) => {
+app.get('/login', (req, res) => {
+    res.send('Login page');
+});
+
+app.post('/login', (req, res) => {
+    req.session.user = { username: req.body.username };
+    res.redirect('/dashboard');
+});
+
+app.get('/dashboard', (req, res) => {
+    if (!req.session.user) return res.redirect('/login');
+    res.send('<h1>Dashboard</h1><a href="/php-test">Тест PHP Браузера</a>');
+});
+
+app.get('/logout', (req, res) => {
+    req.session.destroy();
+    res.redirect('/login');
+});
+
+// ============ ТЕСТОВАЯ СТРАНИЦА PHP БРАУЗЕРА ============
+app.get('/php-test', (req, res) => {
     res.send(`
         <!DOCTYPE html>
         <html>
         <head>
             <meta charset="UTF-8">
-            <title>Axius WRN</title>
+            <title>PHP Браузер Тест</title>
             <style>
                 body { font-family: Arial; background: #1a1a2e; color: #fff; padding: 20px; }
                 input { width: 80%; padding: 15px; background: #2a2a4e; border: 1px solid #444; border-radius: 10px; color: #fff; }
@@ -114,6 +139,11 @@ app.get('/', (req, res) => {
         </body>
         </html>
     `);
+});
+
+app.get('/', (req, res) => {
+    if (req.session.user) return res.redirect('/dashboard');
+    res.redirect('/login');
 });
 
 app.listen(PORT, () => {
