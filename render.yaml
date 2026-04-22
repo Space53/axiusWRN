@@ -2,10 +2,7 @@ services:
   - type: web
     name: axiuswrn
     env: node
-    buildCommand: |
-      apt-get update
-      apt-get install -y php php-curl
-      npm install
+    buildCommand: npm install
     startCommand: node server.js
     envVars:
       - key: YANDEX_TOKEN
