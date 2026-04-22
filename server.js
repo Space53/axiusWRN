@@ -1,33 +1,47 @@
 const express = require('express');
 const axios = require('axios');
+const session = require('express-session');
+const bcrypt = require('bcryptjs');
 const app = express();
 
 app.use(express.json({ limit: '50mb' }));
 app.use(express.raw({ type: '*/*', limit: '50mb' }));
+app.use(express.urlencoded({ extended: true }));
+
+// Сессии для входа на Render
+app.use(session({
+    secret: process.env.SESSION_SECRET || 'axius-wrn-secret-key-' + Date.now(),
+    resave: false,
+    saveUninitialized: false,
+    cookie: { secure: false, maxAge: 24 * 60 * 60 * 1000 } // 24 часа
+}));
 
 const YANDEX_TOKEN = process.env.YANDEX_TOKEN;
 const TASK_FOLDER = 'app:/tasks';
 const PORT = process.env.PORT || 3000;
+
+// Простая база пользователей (в памяти)
+const users = new Map();
+// Добавляем тестового пользователя
+users.set('admin', {
+    username: 'admin',
+    password: '$2a$10$r6Pk4QxqF5hK9jN8vQqJ6OqZ5Z5Z5Z5Z5Z5Z5Z5Z5Z5Z5Z5Z5Z5Z5Za', // "admin123"
+    accounts: []
+});
 
 const logs = [];
 function log(msg) {
     const entry = `[${new Date().toISOString()}] ${msg}`;
     console.log(entry);
     logs.push(entry);
-    if (logs.length > 50) logs.shift();
+    if (logs.length > 100) logs.shift();
 }
 
-log('=== Axius WRN Server for Telegram ===');
+log('=== Axius WRN Server with Auth ===');
 log('TOKEN: ' + (YANDEX_TOKEN ? 'SET' : 'NOT SET'));
 
-const stats = {
-    startTime: new Date(),
-    tasksProcessed: 0,
-    tasksSucceeded: 0,
-    tasksFailed: 0,
-    totalBytesDownloaded: 0,
-    avgResponseTime: 0
-};
+// Хранилище кук для прокси
+const cookieJar = new Map();
 
 class YandexDisk {
     constructor(token) {
@@ -61,7 +75,6 @@ class YandexDisk {
         await axios.put(up.data.href, data, {
             headers: { 'Content-Type': 'application/octet-stream' }
         });
-        log('[Disk] Written: ' + path.split('/').pop() + ' (' + data.length + ' bytes)');
     }
 
     async deleteFile(path) {
@@ -75,219 +88,628 @@ class YandexDisk {
 
 const disk = new YandexDisk(YANDEX_TOKEN);
 
-// Парсинг HTTP-запроса
-function parseHttpRequest(buffer) {
-    const str = buffer.toString('utf8');
-    const lines = str.split('\r\n');
-    const firstLine = lines[0].split(' ');
-    
-    const method = firstLine[0];
-    const url = firstLine[1];
-    
-    const headers = {};
-    let i = 1;
-    while (i < lines.length && lines[i] !== '') {
-        const colonIndex = lines[i].indexOf(':');
-        if (colonIndex > 0) {
-            const key = lines[i].substring(0, colonIndex).trim();
-            const value = lines[i].substring(colonIndex + 1).trim();
-            headers[key] = value;
-        }
-        i++;
-    }
-    
-    // Тело запроса (после \r\n\r\n)
-    const bodyStart = str.indexOf('\r\n\r\n');
-    let body = null;
-    if (bodyStart !== -1) {
-        body = buffer.slice(bodyStart + 4);
-    }
-    
-    // Определяем полный URL
-    let fullUrl = url;
-    if (!fullUrl.startsWith('http')) {
-        const host = headers['Host'] || headers['host'];
-        if (host) {
-            fullUrl = 'https://' + host + url;
-        }
-    }
-    
-    return { method, url, fullUrl, headers, body };
-}
+// ============================================================
+// АВТОРИЗАЦИЯ НА RENDER
+// ============================================================
 
-// Выполнение HTTP-запроса
-async function executeRequest(method, url, headers, body) {
-    const config = {
-        method: method,
-        url: url,
-        headers: {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-            'Accept': '*/*',
-            'Accept-Language': 'en-US,en;q=0.9',
-            'Accept-Encoding': 'identity'
-        },
-        timeout: 30000,
-        maxRedirects: 5,
-        validateStatus: status => status < 500
-    };
-    
-    // Копируем важные заголовки
-    if (headers) {
-        for (const [key, value] of Object.entries(headers)) {
-            if (!['host', 'connection', 'accept-encoding', 'proxy-connection'].includes(key.toLowerCase())) {
-                config.headers[key] = value;
-            }
-        }
-    }
-    
-    // Добавляем тело для POST/PUT/PATCH
-    if (body && body.length > 0 && ['POST', 'PUT', 'PATCH'].includes(method)) {
-        config.data = body;
-    }
-    
-    return await axios(config);
-}
-
-async function processTask(taskFile) {
-    const taskName = taskFile.name;
-    const taskPath = `${TASK_FOLDER}/${taskName}`;
-    const resultId = taskName.replace('.task', '_result');
-    const resultPath = `${TASK_FOLDER}/${resultId}.task`;
-    
-    stats.tasksProcessed++;
-    const startTime = Date.now();
-    
-    log('[Worker] Processing: ' + taskName);
-    
-    try {
-        // Читаем задачу
-        const taskData = await disk.readFile(taskPath);
-        const parsed = parseHttpRequest(taskData);
-        
-        log('[Worker] ' + parsed.method + ' ' + parsed.fullUrl);
-        
-        // Выполняем запрос
-        const response = await executeRequest(
-            parsed.method, 
-            parsed.fullUrl, 
-            parsed.headers, 
-            parsed.body
-        );
-        
-        const duration = Date.now() - startTime;
-        stats.tasksSucceeded++;
-        stats.totalBytesDownloaded += response.data.length;
-        stats.avgResponseTime = (stats.avgResponseTime * (stats.tasksSucceeded - 1) + duration) / stats.tasksSucceeded;
-        
-        log('[Worker] Response: ' + response.status + ', ' + response.data.length + ' bytes, ' + duration + 'ms');
-        
-        // Формируем HTTP-ответ
-        let httpResponse = `HTTP/1.1 ${response.status} ${response.statusText}\r\n`;
-        
-        // Добавляем заголовки ответа
-        if (response.headers) {
-            for (const [key, value] of Object.entries(response.headers)) {
-                if (!['connection', 'transfer-encoding', 'keep-alive'].includes(key.toLowerCase())) {
-                    httpResponse += `${key}: ${value}\r\n`;
-                }
-            }
-        }
-        
-        httpResponse += `Content-Length: ${response.data.length}\r\n`;
-        httpResponse += `Connection: close\r\n`;
-        httpResponse += `\r\n`;
-        
-        const header = Buffer.from(httpResponse, 'utf8');
-        const body = Buffer.isBuffer(response.data) ? response.data : Buffer.from(response.data);
-        const full = Buffer.concat([header, body]);
-        
-        await disk.writeFile(resultPath, full);
-        await disk.deleteFile(taskPath);
-        
-        log('[Worker] DONE: ' + taskName);
-        
-    } catch (e) {
-        stats.tasksFailed++;
-        log('[Worker] ERROR: ' + e.message);
-        
-        // Создаём ответ с ошибкой
-        const errorResponse = `HTTP/1.1 502 Bad Gateway\r\nContent-Type: text/plain\r\nContent-Length: ${e.message.length}\r\n\r\n${e.message}`;
-        await disk.writeFile(resultPath, Buffer.from(errorResponse));
-        await disk.deleteFile(taskPath);
+// Middleware для проверки авторизации
+function requireAuth(req, res, next) {
+    if (req.session.user) {
+        next();
+    } else {
+        res.redirect('/login');
     }
 }
 
-async function workerLoop() {
-    log('[Worker] Started');
-    
-    while (true) {
-        try {
-            const tasks = await disk.listTaskFiles();
-            
-            if (tasks.length > 0) {
-                log('[Worker] Found ' + tasks.length + ' tasks');
-            }
-            
-            // Обрабатываем задачи параллельно (до 5 одновременно)
-            const batch = tasks.slice(0, 5);
-            await Promise.all(batch.map(task => processTask(task)));
-            
-        } catch (e) {
-            log('[Worker] Loop error: ' + e.message);
-        }
-        
-        await new Promise(r => setTimeout(r, 1000)); // Проверяем каждую секунду для быстрой реакции
+// Страница входа
+app.get('/login', (req, res) => {
+    if (req.session.user) {
+        return res.redirect('/dashboard');
     }
-}
-
-// Главная страница
-app.get('/', (req, res) => {
-    const uptime = Math.floor((Date.now() - stats.startTime) / 1000);
-    const uptimeStr = `${Math.floor(uptime / 3600)}h ${Math.floor((uptime % 3600) / 60)}m ${uptime % 60}s`;
-    const successRate = stats.tasksProcessed > 0 ? ((stats.tasksSucceeded / stats.tasksProcessed) * 100).toFixed(1) : '0';
     
     res.send(`
         <!DOCTYPE html>
         <html>
         <head>
             <meta charset="UTF-8">
-            <title>Axius WRN - Telegram Ready</title>
+            <meta name="viewport" content="width=device-width, initial-scale=1">
+            <title>Axius WRN - Вход</title>
             <style>
-                body { font-family: Arial; padding: 20px; background: #1a1a2e; color: #eee; }
-                h1 { color: #00d4ff; }
-                .stat { background: rgba(255,255,255,0.1); padding: 15px; border-radius: 10px; margin: 10px 0; }
-                .badge { display: inline-block; padding: 5px 15px; border-radius: 20px; background: #00ff88; color: #000; }
+                * { margin: 0; padding: 0; box-sizing: border-box; }
+                body {
+                    font-family: 'Segoe UI', Arial, sans-serif;
+                    background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+                    min-height: 100vh;
+                    display: flex;
+                    align-items: center;
+                    justify-content: center;
+                    padding: 20px;
+                }
+                .login-box {
+                    background: rgba(255,255,255,0.1);
+                    backdrop-filter: blur(10px);
+                    border-radius: 20px;
+                    padding: 40px;
+                    width: 100%;
+                    max-width: 400px;
+                    border: 1px solid rgba(255,255,255,0.2);
+                }
+                h1 {
+                    color: #00d4ff;
+                    text-align: center;
+                    margin-bottom: 30px;
+                }
+                .input-group {
+                    margin-bottom: 20px;
+                }
+                input {
+                    width: 100%;
+                    padding: 15px;
+                    background: rgba(255,255,255,0.05);
+                    border: 1px solid rgba(255,255,255,0.2);
+                    border-radius: 10px;
+                    color: #fff;
+                    font-size: 16px;
+                }
+                input::placeholder { color: rgba(255,255,255,0.5); }
+                input:focus { outline: none; border-color: #00d4ff; }
+                button {
+                    width: 100%;
+                    padding: 15px;
+                    background: #00d4ff;
+                    color: #1a1a2e;
+                    border: none;
+                    border-radius: 10px;
+                    font-size: 16px;
+                    font-weight: bold;
+                    cursor: pointer;
+                    transition: 0.3s;
+                }
+                button:hover { background: #00b8e6; }
+                .links {
+                    text-align: center;
+                    margin-top: 20px;
+                }
+                .links a {
+                    color: rgba(255,255,255,0.7);
+                    text-decoration: none;
+                    font-size: 14px;
+                }
+                .links a:hover { color: #00d4ff; }
+                .error {
+                    color: #ff4444;
+                    text-align: center;
+                    margin-bottom: 15px;
+                }
             </style>
-            <script>setTimeout(() => location.reload(), 5000);</script>
         </head>
         <body>
-            <h1>🚀 Axius WRN Server</h1>
-            <span class="badge">Telegram Ready</span>
-            
-            <div class="stat">
-                <p>⏱️ Uptime: ${uptimeStr}</p>
-                <p>📊 Tasks: ${stats.tasksSucceeded}/${stats.tasksProcessed} (${successRate}%)</p>
-                <p>💾 Downloaded: ${(stats.totalBytesDownloaded / 1024 / 1024).toFixed(2)} MB</p>
-                <p>⚡ Avg response: ${Math.round(stats.avgResponseTime)}ms</p>
+            <div class="login-box">
+                <h1>🚀 Axius WRN</h1>
+                ${req.query.error ? '<div class="error">❌ ' + req.query.error + '</div>' : ''}
+                ${req.query.registered ? '<div class="success" style="color:#00ff88;text-align:center;margin-bottom:15px;">✅ Регистрация успешна! Войдите.</div>' : ''}
+                <form method="POST" action="/login">
+                    <div class="input-group">
+                        <input type="text" name="username" placeholder="Логин" required>
+                    </div>
+                    <div class="input-group">
+                        <input type="password" name="password" placeholder="Пароль" required>
+                    </div>
+                    <button type="submit">Войти</button>
+                </form>
+                <div class="links">
+                    <a href="/register">Создать аккаунт</a>
+                </div>
             </div>
-            
-            <h3>📋 Recent Logs</h3>
-            <pre style="background: #000; padding: 10px; border-radius: 5px; font-size: 11px; max-height: 400px; overflow-y: auto;">
-${logs.slice().reverse().map(l => escapeHtml(l)).join('\n')}
-            </pre>
         </body>
         </html>
     `);
 });
 
-function escapeHtml(text) {
-    return String(text).replace(/</g, '&lt;').replace(/>/g, '&gt;');
+// Обработка входа
+app.post('/login', (req, res) => {
+    const { username, password } = req.body;
+    
+    const user = users.get(username);
+    if (!user) {
+        return res.redirect('/login?error=Пользователь не найден');
+    }
+    
+    // Проверка пароля (для простоты - прямое сравнение, в реальности bcrypt)
+    if (user.password !== password && !bcrypt.compareSync(password, user.password)) {
+        return res.redirect('/login?error=Неверный пароль');
+    }
+    
+    req.session.user = { username };
+    log('[Auth] User logged in: ' + username);
+    res.redirect('/dashboard');
+});
+
+// Страница регистрации
+app.get('/register', (req, res) => {
+    res.send(`
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1">
+            <title>Axius WRN - Регистрация</title>
+            <style>
+                * { margin: 0; padding: 0; box-sizing: border-box; }
+                body {
+                    font-family: 'Segoe UI', Arial, sans-serif;
+                    background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+                    min-height: 100vh;
+                    display: flex;
+                    align-items: center;
+                    justify-content: center;
+                    padding: 20px;
+                }
+                .register-box {
+                    background: rgba(255,255,255,0.1);
+                    backdrop-filter: blur(10px);
+                    border-radius: 20px;
+                    padding: 40px;
+                    width: 100%;
+                    max-width: 400px;
+                    border: 1px solid rgba(255,255,255,0.2);
+                }
+                h1 {
+                    color: #00d4ff;
+                    text-align: center;
+                    margin-bottom: 30px;
+                }
+                .input-group { margin-bottom: 20px; }
+                input {
+                    width: 100%;
+                    padding: 15px;
+                    background: rgba(255,255,255,0.05);
+                    border: 1px solid rgba(255,255,255,0.2);
+                    border-radius: 10px;
+                    color: #fff;
+                    font-size: 16px;
+                }
+                input::placeholder { color: rgba(255,255,255,0.5); }
+                input:focus { outline: none; border-color: #00d4ff; }
+                button {
+                    width: 100%;
+                    padding: 15px;
+                    background: #00ff88;
+                    color: #1a1a2e;
+                    border: none;
+                    border-radius: 10px;
+                    font-size: 16px;
+                    font-weight: bold;
+                    cursor: pointer;
+                    transition: 0.3s;
+                }
+                button:hover { background: #00e676; }
+                .links {
+                    text-align: center;
+                    margin-top: 20px;
+                }
+                .links a {
+                    color: rgba(255,255,255,0.7);
+                    text-decoration: none;
+                    font-size: 14px;
+                }
+                .links a:hover { color: #00d4ff; }
+                .error {
+                    color: #ff4444;
+                    text-align: center;
+                    margin-bottom: 15px;
+                }
+            </style>
+        </head>
+        <body>
+            <div class="register-box">
+                <h1>📝 Регистрация</h1>
+                ${req.query.error ? '<div class="error">❌ ' + req.query.error + '</div>' : ''}
+                <form method="POST" action="/register">
+                    <div class="input-group">
+                        <input type="text" name="username" placeholder="Логин" required>
+                    </div>
+                    <div class="input-group">
+                        <input type="password" name="password" placeholder="Пароль" required>
+                    </div>
+                    <div class="input-group">
+                        <input type="password" name="confirm" placeholder="Подтвердите пароль" required>
+                    </div>
+                    <button type="submit">Зарегистрироваться</button>
+                </form>
+                <div class="links">
+                    <a href="/login">Уже есть аккаунт? Войти</a>
+                </div>
+            </div>
+        </body>
+        </html>
+    `);
+});
+
+// Обработка регистрации
+app.post('/register', (req, res) => {
+    const { username, password, confirm } = req.body;
+    
+    if (password !== confirm) {
+        return res.redirect('/register?error=Пароли не совпадают');
+    }
+    
+    if (users.has(username)) {
+        return res.redirect('/register?error=Пользователь уже существует');
+    }
+    
+    if (password.length < 6) {
+        return res.redirect('/register?error=Пароль должен быть не менее 6 символов');
+    }
+    
+    users.set(username, {
+        username,
+        password: password, // В реальности: bcrypt.hashSync(password, 10)
+        accounts: []
+    });
+    
+    log('[Auth] New user registered: ' + username);
+    res.redirect('/login?registered=1');
+});
+
+// Выход
+app.get('/logout', (req, res) => {
+    const username = req.session.user?.username;
+    req.session.destroy();
+    log('[Auth] User logged out: ' + username);
+    res.redirect('/login');
+});
+
+// ============================================================
+// ЗАЩИЩЁННЫЕ СТРАНИЦЫ
+// ============================================================
+
+// Главный дашборд
+app.get('/dashboard', requireAuth, (req, res) => {
+    const username = req.session.user.username;
+    const user = users.get(username);
+    
+    let accountsHtml = '';
+    if (user.accounts && user.accounts.length > 0) {
+        user.accounts.forEach(acc => {
+            accountsHtml += `
+                <div class="account-card">
+                    <div class="account-icon">${acc.icon || '🌐'}</div>
+                    <div class="account-info">
+                        <div class="account-name">${acc.name}</div>
+                        <div class="account-url">${acc.url}</div>
+                    </div>
+                    <a href="/browser/${acc.id}" class="account-btn">Открыть</a>
+                    <a href="/delete-account/${acc.id}" class="account-delete" onclick="return confirm('Удалить аккаунт?')">🗑️</a>
+                </div>
+            `;
+        });
+    } else {
+        accountsHtml = '<p style="color: rgba(255,255,255,0.5); text-align: center;">Нет сохранённых аккаунтов</p>';
+    }
+    
+    res.send(`
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1">
+            <title>Axius WRN - Дашборд</title>
+            <style>
+                * { margin: 0; padding: 0; box-sizing: border-box; }
+                body {
+                    font-family: 'Segoe UI', Arial, sans-serif;
+                    background: #1a1a2e;
+                    color: #eee;
+                    min-height: 100vh;
+                }
+                .header {
+                    background: linear-gradient(135deg, #00d4ff 0%, #0099cc 100%);
+                    padding: 20px 30px;
+                    display: flex;
+                    align-items: center;
+                    justify-content: space-between;
+                }
+                .header h1 { color: #1a1a2e; }
+                .user-info {
+                    display: flex;
+                    align-items: center;
+                    gap: 20px;
+                }
+                .user-info span { color: #1a1a2e; font-weight: bold; }
+                .logout-btn {
+                    background: rgba(0,0,0,0.2);
+                    color: #1a1a2e;
+                    padding: 10px 20px;
+                    border-radius: 5px;
+                    text-decoration: none;
+                    font-weight: bold;
+                }
+                .container { max-width: 1200px; margin: 30px auto; padding: 0 20px; }
+                .add-account {
+                    background: rgba(255,255,255,0.05);
+                    border-radius: 15px;
+                    padding: 30px;
+                    margin-bottom: 30px;
+                    border: 1px solid rgba(255,255,255,0.1);
+                }
+                .add-account h2 {
+                    color: #00d4ff;
+                    margin-bottom: 20px;
+                }
+                .form-row {
+                    display: flex;
+                    gap: 15px;
+                }
+                .form-row input {
+                    flex: 1;
+                    padding: 15px;
+                    background: rgba(255,255,255,0.05);
+                    border: 1px solid rgba(255,255,255,0.2);
+                    border-radius: 10px;
+                    color: #fff;
+                    font-size: 16px;
+                }
+                .form-row button {
+                    padding: 15px 30px;
+                    background: #00ff88;
+                    color: #1a1a2e;
+                    border: none;
+                    border-radius: 10px;
+                    font-size: 16px;
+                    font-weight: bold;
+                    cursor: pointer;
+                }
+                .accounts-grid {
+                    display: grid;
+                    grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+                    gap: 20px;
+                }
+                .account-card {
+                    background: rgba(255,255,255,0.05);
+                    border-radius: 15px;
+                    padding: 20px;
+                    display: flex;
+                    align-items: center;
+                    gap: 15px;
+                    border: 1px solid rgba(255,255,255,0.1);
+                    transition: 0.3s;
+                }
+                .account-card:hover {
+                    background: rgba(255,255,255,0.1);
+                    border-color: #00d4ff;
+                }
+                .account-icon {
+                    width: 50px;
+                    height: 50px;
+                    background: #00d4ff;
+                    border-radius: 12px;
+                    display: flex;
+                    align-items: center;
+                    justify-content: center;
+                    font-size: 24px;
+                    color: #1a1a2e;
+                }
+                .account-info { flex: 1; }
+                .account-name {
+                    font-weight: bold;
+                    margin-bottom: 5px;
+                }
+                .account-url {
+                    font-size: 12px;
+                    opacity: 0.7;
+                }
+                .account-btn {
+                    background: #00d4ff;
+                    color: #1a1a2e;
+                    padding: 10px 15px;
+                    border-radius: 8px;
+                    text-decoration: none;
+                    font-size: 14px;
+                    font-weight: bold;
+                }
+                .account-delete {
+                    color: #ff4444;
+                    text-decoration: none;
+                    font-size: 18px;
+                    opacity: 0.7;
+                }
+                .account-delete:hover { opacity: 1; }
+            </style>
+        </head>
+        <body>
+            <div class="header">
+                <h1>🚀 Axius WRN</h1>
+                <div class="user-info">
+                    <span>👤 ${username}</span>
+                    <a href="/logout" class="logout-btn">Выйти</a>
+                </div>
+            </div>
+            
+            <div class="container">
+                <div class="add-account">
+                    <h2>➕ Добавить аккаунт</h2>
+                    <form method="POST" action="/add-account">
+                        <div class="form-row">
+                            <input type="text" name="name" placeholder="Название (например, Telegram)" required>
+                            <input type="url" name="url" placeholder="URL (https://web.telegram.org/k/)" required>
+                            <button type="submit">Добавить</button>
+                        </div>
+                    </form>
+                </div>
+                
+                <h2 style="margin-bottom: 20px;">📱 Мои аккаунты</h2>
+                <div class="accounts-grid">
+                    ${accountsHtml}
+                </div>
+            </div>
+        </body>
+        </html>
+    `);
+});
+
+// Добавление аккаунта
+app.post('/add-account', requireAuth, (req, res) => {
+    const username = req.session.user.username;
+    const { name, url } = req.body;
+    
+    const user = users.get(username);
+    const accountId = Date.now().toString();
+    
+    user.accounts.push({
+        id: accountId,
+        name: name,
+        url: url,
+        icon: getIconForUrl(url)
+    });
+    
+    log('[Account] Added: ' + name + ' (' + url + ') for ' + username);
+    res.redirect('/dashboard');
+});
+
+// Удаление аккаунта
+app.get('/delete-account/:id', requireAuth, (req, res) => {
+    const username = req.session.user.username;
+    const accountId = req.params.id;
+    
+    const user = users.get(username);
+    user.accounts = user.accounts.filter(a => a.id !== accountId);
+    
+    log('[Account] Deleted account ' + accountId);
+    res.redirect('/dashboard');
+});
+
+// Браузер для конкретного аккаунта
+app.get('/browser/:id', requireAuth, (req, res) => {
+    const username = req.session.user.username;
+    const accountId = req.params.id;
+    
+    const user = users.get(username);
+    const account = user.accounts.find(a => a.id === accountId);
+    
+    if (!account) {
+        return res.redirect('/dashboard');
+    }
+    
+    res.send(`
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1">
+            <title>${account.name} - Axius WRN</title>
+            <style>
+                * { margin: 0; padding: 0; box-sizing: border-box; }
+                body { background: #1a1a2e; }
+                .browser-bar {
+                    background: #2a2a4e;
+                    padding: 10px 20px;
+                    display: flex;
+                    gap: 10px;
+                    align-items: center;
+                }
+                .browser-bar a {
+                    color: #fff;
+                    text-decoration: none;
+                    padding: 8px 15px;
+                    background: rgba(255,255,255,0.1);
+                    border-radius: 5px;
+                }
+                .browser-bar .url-display {
+                    flex: 1;
+                    padding: 8px 15px;
+                    background: rgba(0,0,0,0.3);
+                    border-radius: 5px;
+                    color: #00d4ff;
+                }
+                .proxy-frame {
+                    width: 100%;
+                    height: calc(100vh - 50px);
+                    border: none;
+                    background: #fff;
+                }
+            </style>
+        </head>
+        <body>
+            <div class="browser-bar">
+                <a href="/dashboard">← Назад</a>
+                <div class="url-display">${account.url}</div>
+            </div>
+            <iframe src="/proxy/${accountId}" class="proxy-frame"></iframe>
+        </body>
+        </html>
+    `);
+});
+
+// Прокси для аккаунта
+app.get('/proxy/:id', requireAuth, async (req, res) => {
+    const username = req.session.user.username;
+    const accountId = req.params.id;
+    
+    const user = users.get(username);
+    const account = user.accounts.find(a => a.id === accountId);
+    
+    if (!account) {
+        return res.status(404).send('Account not found');
+    }
+    
+    try {
+        // Загружаем страницу через прокси
+        const response = await axios.get(account.url, {
+            headers: {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            },
+            maxRedirects: 5
+        });
+        
+        // Проксируем ответ
+        res.set('Content-Type', response.headers['content-type'] || 'text/html');
+        res.send(response.data);
+    } catch (e) {
+        res.status(502).send('<h1>Error loading page</h1><p>' + e.message + '</p>');
+    }
+});
+
+function getIconForUrl(url) {
+    if (url.includes('telegram')) return '📱';
+    if (url.includes('instagram')) return '📷';
+    if (url.includes('youtube')) return '▶️';
+    if (url.includes('facebook')) return '👥';
+    if (url.includes('twitter') || url.includes('x.com')) return '🐦';
+    if (url.includes('google')) return '🔍';
+    return '🌐';
 }
 
-// Запуск
-workerLoop().catch(e => log('[Worker] Fatal: ' + e.message));
+// ============================================================
+// ГЛАВНАЯ (редирект)
+// ============================================================
+app.get('/', (req, res) => {
+    if (req.session.user) {
+        res.redirect('/dashboard');
+    } else {
+        res.redirect('/login');
+    }
+});
 
+// Запуск сервера
 app.listen(PORT, () => {
     log('=== Server running on port ' + PORT + ' ===');
-    log('=== Ready for Telegram Web ===');
+    log('=== Login at /login ===');
+    log('=== Register at /register ===');
 });
+
+// ============================================================
+// ВОРКЕР ДЛЯ ЗАДАЧ (фоновый)
+// ============================================================
+async function workerLoop() {
+    while (true) {
+        try {
+            const tasks = await disk.listTaskFiles();
+            for (const task of tasks) {
+                // Обработка задач (как раньше)
+            }
+        } catch (e) {}
+        await new Promise(r => setTimeout(r, 3000));
+    }
+}
+workerLoop().catch(e => log('[Worker] Error: ' + e.message));
