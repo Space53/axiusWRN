@@ -1,8 +1,7 @@
 const express = require('express');
 const session = require('express-session');
-const { exec } = require('child_process');
-const fs = require('fs');
 const axios = require('axios');
+const fs = require('fs');
 const app = express();
 
 app.use(express.json({ limit: '50mb' }));
@@ -100,66 +99,59 @@ class YandexDisk {
 
 const disk = new YandexDisk(YANDEX_TOKEN);
 
-// ============ PHP БРАУЗЕР (НОВЫЙ КОМПОНЕНТ) ============
-app.get('/php-browser', (req, res) => {
-    const url = req.query.url;
-    if (!url) return res.status(400).send('URL required');
+// ============ NODE.JS БРАУЗЕР (КУКИ СОХРАНЯЮТСЯ) ============
+const cookieJar = {};
+
+async function nodeBrowser(url, sessionId = 'default') {
+    const parsed = new URL(url);
+    const host = parsed.hostname;
     
-    log('PHP Browser: ' + url);
+    // Загружаем куки для этого хоста
+    const cookieFile = `/tmp/cookies_${host}.json`;
+    let cookies = [];
+    if (fs.existsSync(cookieFile)) {
+        cookies = JSON.parse(fs.readFileSync(cookieFile));
+    }
     
-    const phpCode = `<?php
-        $url = '${url}';
-        
-        $ch = curl_init();
-        curl_setopt($ch, CURLOPT_URL, $url);
-        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-        curl_setopt($ch, CURLOPT_FOLLOWLOCATION, true);
-        curl_setopt($ch, CURLOPT_TIMEOUT, 60);
-        curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
-        curl_setopt($ch, CURLOPT_USERAGENT, 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36');
-        curl_setopt($ch, CURLOPT_HTTPHEADER, [
-            'Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-            'Accept-Language: en-US,en;q=0.5'
-        ]);
-        
-        $html = curl_exec($ch);
-        $error = curl_error($ch);
-        curl_close($ch);
-        
-        if ($error || !$html) {
-            http_response_code(500);
-            echo "Error: " . ($error ?: "Failed to fetch URL");
-            exit;
-        }
-        
-        $parsed = parse_url($url);
-        $base = $parsed['scheme'] . '://' . $parsed['host'];
-        $html = str_replace('<head>', '<head><base href="' . $base . '/">', $html);
-        
-        echo $html;
-    ?>`;
+    const cookieString = cookies.map(c => `${c.name}=${c.value}`).join('; ');
     
-    const phpFile = `/tmp/browser_${Date.now()}.php`;
-    fs.writeFileSync(phpFile, phpCode);
+    log('[Browser] Fetching: ' + url);
     
-    exec(`php ${phpFile}`, (error, stdout, stderr) => {
-        fs.unlinkSync(phpFile);
-        
-        if (error) {
-            log('PHP Error: ' + error.message, 'ERROR');
-            return res.status(500).send(`PHP Error: ${error.message}`);
-        }
-        
-        res.send(stdout);
+    const response = await axios.get(url, {
+        headers: {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.5',
+            'Cookie': cookieString
+        },
+        timeout: 30000,
+        maxRedirects: 5
     });
-});
+    
+    // Сохраняем куки из ответа
+    const setCookie = response.headers['set-cookie'];
+    if (setCookie) {
+        const newCookies = (Array.isArray(setCookie) ? setCookie : [setCookie])
+            .map(c => {
+                const parts = c.split(';')[0].split('=');
+                return { name: parts[0], value: parts[1] };
+            });
+        fs.writeFileSync(cookieFile, JSON.stringify(newCookies));
+    }
+    
+    let html = response.data;
+    const base = parsed.origin;
+    html = html.replace('<head>', `<head><base href="${base}/">`);
+    
+    log('[Browser] Done: ' + html.length + ' bytes');
+    
+    return html;
+}
 
 // ============ ВОРКЕР ДЛЯ ОБРАБОТКИ ЗАДАЧ ============
 async function processTask(taskFile) {
     const taskName = taskFile.name;
-    const taskPath = `${TASK_FOLDER}/${taskName}`;
     const resultId = taskName.replace('.task', '_result') + '.task';
-    const resultPath = `${TASK_FOLDER}/${resultId}`;
     
     log('[Worker] Processing: ' + taskName);
     
@@ -179,26 +171,11 @@ async function processTask(taskFile) {
             return;
         }
         
-        log('[Worker] Fetching: ' + url);
+        const html = await nodeBrowser(url);
         
-        const response = await axios.get(url, {
-            responseType: 'arraybuffer',
-            timeout: 30000,
-            maxRedirects: 5,
-            headers: { 'User-Agent': 'Mozilla/5.0' }
-        });
+        const httpResponse = `HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: ${html.length}\r\n\r\n${html}`;
         
-        log('[Worker] Response: ' + response.status + ', ' + response.data.length + ' bytes');
-        
-        let httpResponse = `HTTP/1.1 ${response.status} OK\r\n`;
-        httpResponse += `Content-Type: text/html\r\n`;
-        httpResponse += `Content-Length: ${response.data.length}\r\n\r\n`;
-        
-        const header = Buffer.from(httpResponse, 'utf8');
-        const body = Buffer.from(response.data);
-        const full = Buffer.concat([header, body]);
-        
-        await disk.writeFile(resultId, full);
+        await disk.writeFile(resultId, Buffer.from(httpResponse));
         await disk.deleteFile(taskName);
         
         log('[Worker] DONE: ' + taskName);
@@ -233,29 +210,29 @@ async function workerLoop() {
     }
 }
 
-// ============ СТАРЫЙ API ============
+// ============ API ============
 app.post('/fetch', async (req, res) => {
     const { task_id, target_url } = req.body;
-    
-    log('[API] /fetch: ' + task_id + ' -> ' + target_url);
-    
-    if (!task_id || !target_url) {
-        return res.status(400).json({ error: 'Missing fields' });
-    }
-    
+    log('[API] /fetch: ' + task_id);
     res.status(202).json({ status: 'queued', task_id });
 });
 
 app.get('/result', async (req, res) => {
-    const { task_id } = req.query;
-    
-    log('[API] /result: ' + task_id);
-    
-    if (!task_id) {
-        return res.status(400).json({ error: 'Missing task_id' });
-    }
-    
     res.json({ status: 'processing' });
+});
+
+// ============ БРАУЗЕР ЭНДПОИНТ ============
+app.get('/browser', async (req, res) => {
+    const url = req.query.url;
+    if (!url) return res.status(400).send('URL required');
+    
+    try {
+        const html = await nodeBrowser(url, req.session.id);
+        res.send(html);
+    } catch (e) {
+        log('[Browser] Error: ' + e.message, 'ERROR');
+        res.status(500).send(`<h1>Ошибка</h1><p>${e.message}</p>`);
+    }
 });
 
 // ============ АВТОРИЗАЦИЯ ============
@@ -275,30 +252,25 @@ app.get('/login', (req, res) => {
         <html>
         <head>
             <meta charset="UTF-8">
-            <meta name="viewport" content="width=device-width, initial-scale=1">
             <title>Axius WRN - Вход</title>
             <style>
                 body { font-family: Arial; background: #1a1a2e; display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0; }
                 .box { background: #2a2a4e; padding: 40px; border-radius: 20px; width: 350px; }
                 h1 { color: #00d4ff; text-align: center; }
-                input { width: 100%; padding: 15px; margin: 10px 0; background: #1a1a2e; border: 1px solid #444; border-radius: 10px; color: #fff; box-sizing: border-box; }
+                input { width: 100%; padding: 15px; margin: 10px 0; background: #1a1a2e; border: 1px solid #444; border-radius: 10px; color: #fff; }
                 button { width: 100%; padding: 15px; background: #00d4ff; border: none; border-radius: 10px; font-weight: bold; cursor: pointer; }
-                .error { color: #ff4444; text-align: center; }
                 a { color: #00d4ff; }
-                .hint { color: #888; font-size: 12px; text-align: center; margin-top: 15px; }
             </style>
         </head>
         <body>
             <div class="box">
                 <h1>🚀 Axius WRN</h1>
-                ${req.query.error ? '<div class="error">❌ ' + req.query.error + '</div>' : ''}
                 <form method="POST" action="/login">
                     <input type="text" name="username" placeholder="Логин" value="admin" required>
                     <input type="password" name="password" placeholder="Пароль" value="admin123" required>
                     <button type="submit">Войти</button>
                 </form>
-                <p style="text-align: center; margin-top: 20px;"><a href="/register">Создать аккаунт</a></p>
-                <div class="hint">admin / admin123</div>
+                <p style="text-align: center; margin-top: 20px;"><a href="/register">Регистрация</a></p>
             </div>
         </body>
         </html>
@@ -324,29 +296,26 @@ app.get('/register', (req, res) => {
         <html>
         <head>
             <meta charset="UTF-8">
-            <meta name="viewport" content="width=device-width, initial-scale=1">
-            <title>Axius WRN - Регистрация</title>
+            <title>Регистрация</title>
             <style>
                 body { font-family: Arial; background: #1a1a2e; display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0; }
                 .box { background: #2a2a4e; padding: 40px; border-radius: 20px; width: 350px; }
                 h1 { color: #00ff88; text-align: center; }
-                input { width: 100%; padding: 15px; margin: 10px 0; background: #1a1a2e; border: 1px solid #444; border-radius: 10px; color: #fff; box-sizing: border-box; }
+                input { width: 100%; padding: 15px; margin: 10px 0; background: #1a1a2e; border: 1px solid #444; border-radius: 10px; color: #fff; }
                 button { width: 100%; padding: 15px; background: #00ff88; border: none; border-radius: 10px; font-weight: bold; cursor: pointer; }
-                .error { color: #ff4444; text-align: center; }
                 a { color: #00d4ff; }
             </style>
         </head>
         <body>
             <div class="box">
                 <h1>📝 Регистрация</h1>
-                ${req.query.error ? '<div class="error">❌ ' + req.query.error + '</div>' : ''}
                 <form method="POST" action="/register">
                     <input type="text" name="username" placeholder="Логин" required>
                     <input type="password" name="password" placeholder="Пароль" required>
                     <input type="password" name="confirm" placeholder="Подтвердите пароль" required>
                     <button type="submit">Зарегистрироваться</button>
                 </form>
-                <p style="text-align: center; margin-top: 20px;"><a href="/login">← Назад ко входу</a></p>
+                <p style="text-align: center; margin-top: 20px;"><a href="/login">← Назад</a></p>
             </div>
         </body>
         </html>
@@ -383,7 +352,7 @@ app.get('/dashboard', requireAuth, (req, res) => {
     let sitesHtml = '';
     if (user.sites && user.sites.length > 0) {
         user.sites.forEach(site => {
-            const icon = site.url.includes('telegram') ? '📱' : (site.url.includes('google') ? '🔍' : '🌐');
+            const icon = site.url.includes('telegram') ? '📱' : '🌐';
             sitesHtml += `
                 <div style="background:#2a2a4e;padding:15px;border-radius:15px;display:flex;align-items:center;gap:15px;margin-bottom:10px;">
                     <div style="width:40px;height:40px;background:#00d4ff;border-radius:10px;display:flex;align-items:center;justify-content:center;font-size:20px;">${icon}</div>
@@ -391,13 +360,11 @@ app.get('/dashboard', requireAuth, (req, res) => {
                         <div style="font-weight:bold;">${site.name}</div>
                         <div style="font-size:12px;opacity:0.7;">${site.url}</div>
                     </div>
-                    <a href="/browser/${site.id}" style="background:#00d4ff;color:#1a1a2e;padding:8px 12px;border-radius:8px;text-decoration:none;">Открыть</a>
-                    <a href="/delete-site/${site.id}" style="color:#ff4444;text-decoration:none;" onclick="return confirm('Удалить?')">🗑️</a>
+                    <a href="/view/${site.id}" style="background:#00d4ff;color:#1a1a2e;padding:8px 12px;border-radius:8px;text-decoration:none;">Открыть</a>
+                    <a href="/delete/${site.id}" style="color:#ff4444;" onclick="return confirm('Удалить?')">🗑️</a>
                 </div>
             `;
         });
-    } else {
-        sitesHtml = '<p style="color: rgba(255,255,255,0.5);">Нет сохранённых сайтов</p>';
     }
     
     res.send(`
@@ -405,52 +372,45 @@ app.get('/dashboard', requireAuth, (req, res) => {
         <html>
         <head>
             <meta charset="UTF-8">
-            <meta name="viewport" content="width=device-width, initial-scale=1">
-            <title>Axius WRN - Дашборд</title>
+            <title>Дашборд</title>
             <style>
                 body { font-family: Arial; background: #1a1a2e; color: #eee; margin: 0; }
-                .header { background: linear-gradient(135deg, #00d4ff, #0099cc); padding: 20px; display: flex; justify-content: space-between; align-items: center; }
+                .header { background: #00d4ff; padding: 20px; display: flex; justify-content: space-between; }
                 .header h1 { color: #1a1a2e; margin: 0; }
                 .container { max-width: 800px; margin: 30px auto; padding: 20px; }
                 .add-box { background: #2a2a4e; padding: 30px; border-radius: 15px; margin-bottom: 30px; }
-                .add-box input { width: 100%; padding: 15px; margin: 10px 0; background: #1a1a2e; border: 1px solid #444; border-radius: 10px; color: #fff; box-sizing: border-box; }
+                .add-box input { width: 100%; padding: 15px; margin: 10px 0; background: #1a1a2e; border: 1px solid #444; border-radius: 10px; color: #fff; }
                 .add-box button { width: 100%; padding: 15px; background: #00ff88; border: none; border-radius: 10px; font-weight: bold; cursor: pointer; }
                 .logout { background: rgba(0,0,0,0.2); color: #1a1a2e; padding: 10px 20px; border-radius: 5px; text-decoration: none; }
-                .nav-links { display: flex; gap: 10px; }
-                .nav-links a { color: #1a1a2e; text-decoration: none; padding: 10px 15px; background: rgba(0,0,0,0.1); border-radius: 5px; }
             </style>
         </head>
         <body>
             <div class="header">
                 <h1>🚀 Axius WRN</h1>
-                <div style="display: flex; align-items: center; gap: 20px;">
-                    <div class="nav-links">
-                        <a href="/logs">📋 Логи</a>
-                        <a href="/php-test">🧪 PHP Браузер</a>
-                    </div>
+                <div>
                     <span>👤 ${username}</span>
                     <a href="/logout" class="logout">Выйти</a>
+                    <a href="/logs" style="color:#1a1a2e;margin-left:10px;">📋 Логи</a>
                 </div>
             </div>
             <div class="container">
                 <div class="add-box">
                     <h2>➕ Добавить сайт</h2>
-                    <form method="POST" action="/add-site">
+                    <form method="POST" action="/add">
                         <input type="text" name="name" placeholder="Название" required>
                         <input type="url" name="url" placeholder="URL" value="https://web.telegram.org/k/" required>
                         <button type="submit">Добавить</button>
                     </form>
-                    <p style="font-size: 12px; opacity: 0.7; margin-top: 10px;">💡 Сайты открываются через PHP браузер (обходит блокировки)</p>
                 </div>
                 <h2>📱 Мои сайты</h2>
-                ${sitesHtml}
+                ${sitesHtml || '<p style="opacity:0.5;">Нет сайтов</p>'}
             </div>
         </body>
         </html>
     `);
 });
 
-app.post('/add-site', requireAuth, (req, res) => {
+app.post('/add', requireAuth, (req, res) => {
     const username = req.session.user.username;
     const { name, url } = req.body;
     
@@ -458,86 +418,47 @@ app.post('/add-site', requireAuth, (req, res) => {
     users[username].sites.push({ id: Date.now().toString(), name, url });
     saveUsers();
     
-    log('[Site] Added: ' + name);
     res.redirect('/dashboard');
 });
 
-app.get('/delete-site/:id', requireAuth, (req, res) => {
-    const username = req.session.user.username;
-    users[username].sites = users[username].sites.filter(s => s.id !== req.params.id);
-    saveUsers();
-    res.redirect('/dashboard');
-});
-
-app.get('/browser/:id', requireAuth, (req, res) => {
+app.get('/view/:id', requireAuth, (req, res) => {
     const username = req.session.user.username;
     const site = users[username].sites?.find(s => s.id === req.params.id);
     
     if (!site) return res.redirect('/dashboard');
     
-    const proxyUrl = `/php-browser?url=${encodeURIComponent(site.url)}`;
-    
-    log('[Browser] Opening: ' + site.name);
+    const browserUrl = `/browser?url=${encodeURIComponent(site.url)}`;
     
     res.send(`
         <!DOCTYPE html>
         <html>
         <head>
             <meta charset="UTF-8">
-            <meta name="viewport" content="width=device-width, initial-scale=1">
-            <title>${site.name} - Axius WRN</title>
+            <title>${site.name}</title>
             <style>
                 body { margin: 0; background: #1a1a2e; }
-                .bar { background: #2a2a4e; padding: 10px 20px; display: flex; gap: 10px; align-items: center; }
+                .bar { background: #2a2a4e; padding: 10px 20px; display: flex; gap: 10px; }
                 .bar a { color: #fff; text-decoration: none; padding: 8px 15px; background: #3a3a5e; border-radius: 5px; }
                 .url { flex: 1; padding: 8px 15px; background: #1a1a2e; border-radius: 5px; color: #00d4ff; }
-                iframe { width: 100%; height: calc(100vh - 50px); border: none; background: #fff; }
+                iframe { width: 100%; height: calc(100vh - 50px); border: none; }
             </style>
         </head>
         <body>
             <div class="bar">
                 <a href="/dashboard">← Назад</a>
                 <div class="url">${site.url}</div>
-                <a href="/logs">📋 Логи</a>
             </div>
-            <iframe src="${proxyUrl}" sandbox="allow-same-origin allow-scripts allow-forms allow-popups allow-modals allow-top-navigation"></iframe>
+            <iframe src="${browserUrl}" sandbox="allow-same-origin allow-scripts allow-forms allow-popups"></iframe>
         </body>
         </html>
     `);
 });
 
-app.get('/php-test', (req, res) => {
-    res.send(`
-        <!DOCTYPE html>
-        <html>
-        <head>
-            <meta charset="UTF-8">
-            <title>PHP Браузер Тест</title>
-            <style>
-                body { font-family: Arial; background: #1a1a2e; color: #fff; padding: 20px; margin: 0; }
-                .bar { background: #2a2a4e; padding: 10px; display: flex; gap: 10px; }
-                input { flex: 1; padding: 15px; background: #1a1a2e; border: 1px solid #444; border-radius: 10px; color: #fff; }
-                button { padding: 15px 30px; background: #00d4ff; border: none; border-radius: 10px; font-weight: bold; cursor: pointer; }
-                iframe { width: 100%; height: calc(100vh - 80px); border: none; margin-top: 10px; background: #fff; }
-            </style>
-        </head>
-        <body>
-            <div class="bar">
-                <a href="/dashboard" style="color:#00d4ff;text-decoration:none;padding:15px;">← Назад</a>
-                <input type="url" id="url" placeholder="Введите URL" value="https://web.telegram.org/k/">
-                <button onclick="loadUrl()">Открыть</button>
-            </div>
-            <iframe id="browser"></iframe>
-            <script>
-                function loadUrl() {
-                    const url = document.getElementById('url').value;
-                    document.getElementById('browser').src = '/php-browser?url=' + encodeURIComponent(url);
-                }
-                loadUrl();
-            </script>
-        </body>
-        </html>
-    `);
+app.get('/delete/:id', requireAuth, (req, res) => {
+    const username = req.session.user.username;
+    users[username].sites = users[username].sites.filter(s => s.id !== req.params.id);
+    saveUsers();
+    res.redirect('/dashboard');
 });
 
 app.get('/logs', requireAuth, (req, res) => {
@@ -546,33 +467,21 @@ app.get('/logs', requireAuth, (req, res) => {
         <html>
         <head>
             <meta charset="UTF-8">
-            <title>Axius WRN - Логи</title>
+            <title>Логи</title>
             <style>
-                body { font-family: monospace; background: #1a1a2e; color: #0f0; padding: 20px; margin: 0; }
-                h1 { color: #00d4ff; }
-                .nav { margin-bottom: 20px; }
-                .nav a { color: #00d4ff; margin-right: 20px; text-decoration: none; }
-                .log-container { background: #0d0d1a; padding: 20px; border-radius: 10px; max-height: 80vh; overflow-y: auto; }
-                .log-entry { padding: 5px 0; border-bottom: 1px solid #2a2a4e; font-size: 13px; }
+                body { font-family: monospace; background: #1a1a2e; color: #0f0; padding: 20px; }
+                a { color: #00d4ff; }
+                pre { background: #0d0d1a; padding: 20px; border-radius: 10px; }
             </style>
         </head>
         <body>
-            <div class="nav">
-                <a href="/dashboard">← Дашборд</a>
-                <a href="/logs">🔄 Обновить</a>
-            </div>
-            <h1>📋 Логи сервера</h1>
-            <div class="log-container">
-    `;
+            <a href="/dashboard">← Назад</a>
+            <h1>📋 Логи</h1>
+            <pre>`;
     
-    logs.slice().reverse().forEach(l => html += `<div class="log-entry">${l}</div>`);
+    logs.slice().reverse().forEach(l => html += l + '\n');
     
-    html += `
-            </div>
-            <script>setTimeout(() => location.reload(), 5000);</script>
-        </body>
-        </html>
-    `;
+    html += `</pre></body></html>`;
     
     res.send(html);
 });
@@ -586,8 +495,7 @@ app.get('/', (req, res) => {
 app.listen(PORT, () => {
     log('=== Server running on port ' + PORT + ' ===');
     log('=== Login: admin / admin123 ===');
-    log('=== PHP Browser: /php-browser?url=... ===');
+    log('=== Browser: /browser?url=... ===');
 });
 
-// Запускаем воркер
 workerLoop().catch(e => log('[Worker] Fatal: ' + e.message));
