@@ -18,6 +18,7 @@ app.use(session({
 const PORT = process.env.PORT || 3000;
 const YANDEX_TOKEN = process.env.YANDEX_TOKEN || '';
 const TASK_FOLDER = 'app:/tasks';
+const BOT_FOLDER = 'app:/bots';
 
 // ============ ЛОГИ ============
 const logs = [];
@@ -29,6 +30,7 @@ function log(msg, level = 'INFO') {
 }
 
 log('=== Axius WRN Server Starting ===');
+log('TOKEN: ' + (YANDEX_TOKEN ? 'SET' : 'NOT SET'));
 
 // ============ ПОЛЬЗОВАТЕЛИ ============
 const usersFile = '/tmp/users.json';
@@ -41,7 +43,6 @@ if (fs.existsSync(usersFile)) {
     }
 }
 
-// Гарантированно создаём админа
 if (!users['admin']) {
     users['admin'] = {
         username: 'admin',
@@ -51,7 +52,6 @@ if (!users['admin']) {
     };
 }
 
-// Гарантированно добавляем bots и sites всем пользователям
 for (const username in users) {
     if (!users[username].sites) users[username].sites = [];
     if (!users[username].bots) users[username].bots = [];
@@ -124,9 +124,7 @@ class YandexDisk {
 
 const disk = new YandexDisk(YANDEX_TOKEN);
 
-// ============ TELEGRAM BOT API ============
-const BOT_FOLDER = 'app:/bots';
-
+// ============ TELEGRAM BOT MANAGER ============
 class TelegramBotManager {
     constructor(disk) {
         this.disk = disk;
@@ -137,7 +135,6 @@ class TelegramBotManager {
         const tokenFile = `${botPath}/token.txt`;
         const configFile = `${botPath}/config.json`;
 
-        // Создаём папку бота
         await this.disk.writeFile(tokenFile, Buffer.from(botToken));
         await this.disk.writeFile(configFile, Buffer.from(JSON.stringify({
             bot_username: botUsername,
@@ -146,7 +143,6 @@ class TelegramBotManager {
             status: 'active'
         }, null, 2)));
 
-        // Создаём папку для чатов
         await this.disk.writeFile(`${botPath}/chats/.gitkeep`, Buffer.from(''));
 
         log(`[Bot] Registered @${botUsername} for ${username}`);
@@ -154,12 +150,8 @@ class TelegramBotManager {
     }
 
     async getUserBots(username) {
-        const bots = [];
         const user = users[username];
-        if (user && user.bots) {
-            return user.bots;
-        }
-        return bots;
+        return (user && user.bots) ? user.bots : [];
     }
 
     async getBotChats(botUsername) {
@@ -203,7 +195,15 @@ class TelegramBotManager {
         try {
             botToken = (await this.disk.readFile(tokenFile)).toString().trim();
         } catch (e) {
-            throw new Error('Bot token not found');
+            // Если токена нет на диске, ищем в пользователях
+            const username = users['admin']?.username || 'admin';
+            const user = users[username];
+            const bot = (user?.bots || []).find(b => b.username === botUsername);
+            if (bot && bot.token) {
+                botToken = bot.token;
+            } else {
+                throw new Error('Bot token not found');
+            }
         }
 
         const response = await axios.post(
@@ -211,7 +211,6 @@ class TelegramBotManager {
             { chat_id: chatId, text: text }
         );
 
-        // Сохраняем сообщение
         const notification = {
             type: 'message_sent',
             chat_id: chatId,
@@ -222,7 +221,9 @@ class TelegramBotManager {
         };
 
         const notifPath = `${BOT_FOLDER}/${botUsername}/chats/@${chatId}/notifications/notif_${Date.now()}.json`;
-        await this.disk.writeFile(notifPath, Buffer.from(JSON.stringify(notification, null, 2)));
+        try {
+            await this.disk.writeFile(notifPath, Buffer.from(JSON.stringify(notification, null, 2)));
+        } catch (e) {}
 
         return { success: true, message_id: response.data.result.message_id };
     }
@@ -230,7 +231,6 @@ class TelegramBotManager {
     async deleteBot(username, botUsername) {
         const botPath = `${BOT_FOLDER}/${botUsername}`;
         try {
-            // Удаляем все файлы бота
             const items = await this.disk.listFolder(botPath);
             for (const item of items) {
                 await this.disk.deleteFile(item.path);
@@ -262,12 +262,13 @@ app.get('/login', (req, res) => {
         <html>
         <head>
             <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1">
             <title>Axius WRN - Вход</title>
             <style>
                 body { font-family: Arial; background: #1a1a2e; display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0; }
                 .box { background: #2a2a4e; padding: 40px; border-radius: 20px; width: 350px; }
                 h1 { color: #00d4ff; text-align: center; }
-                input { width: 100%; padding: 15px; margin: 10px 0; background: #1a1a2e; border: 1px solid #444; border-radius: 10px; color: #fff; }
+                input { width: 100%; padding: 15px; margin: 10px 0; background: #1a1a2e; border: 1px solid #444; border-radius: 10px; color: #fff; box-sizing: border-box; }
                 button { width: 100%; padding: 15px; background: #00d4ff; border: none; border-radius: 10px; font-weight: bold; cursor: pointer; }
                 a { color: #00d4ff; }
             </style>
@@ -275,6 +276,7 @@ app.get('/login', (req, res) => {
         <body>
             <div class="box">
                 <h1>🚀 Axius WRN</h1>
+                ${req.query.error ? '<p style="color:#ff4444;">❌ ' + req.query.error + '</p>' : ''}
                 <form method="POST" action="/login">
                     <input type="text" name="username" placeholder="Логин" value="admin" required>
                     <input type="password" name="password" placeholder="Пароль" value="admin123" required>
@@ -376,7 +378,7 @@ app.get('/dashboard', requireAuth, (req, res) => {
                 .container { max-width: 800px; margin: 30px auto; padding: 20px; }
                 .section { background: #2a2a4e; padding: 30px; border-radius: 15px; margin-bottom: 30px; }
                 .section h2 { margin-top: 0; color: #00d4ff; }
-                input { width: 100%; padding: 15px; margin: 10px 0; background: #1a1a2e; border: 1px solid #444; border-radius: 10px; color: #fff; }
+                input { width: 100%; padding: 15px; margin: 10px 0; background: #1a1a2e; border: 1px solid #444; border-radius: 10px; color: #fff; box-sizing: border-box; }
                 button { width: 100%; padding: 15px; background: #00ff88; border: none; border-radius: 10px; font-weight: bold; cursor: pointer; }
                 .card { background: #3a3a5e; padding: 15px; border-radius: 10px; display: flex; align-items: center; gap: 15px; margin-bottom: 10px; }
                 .icon { font-size: 30px; }
@@ -384,12 +386,17 @@ app.get('/dashboard', requireAuth, (req, res) => {
                 .name { font-weight: bold; }
                 .btn { background: #00d4ff; color: #1a1a2e; padding: 8px 15px; border-radius: 8px; text-decoration: none; }
                 .logout { background: rgba(0,0,0,0.2); color: #1a1a2e; padding: 10px 20px; border-radius: 5px; text-decoration: none; }
+                .nav { display: flex; gap: 10px; }
+                .nav a { color: #1a1a2e; text-decoration: none; padding: 10px; background: rgba(0,0,0,0.1); border-radius: 5px; }
             </style>
         </head>
         <body>
             <div class="header">
                 <h1>🚀 Axius WRN</h1>
-                <div>
+                <div style="display: flex; gap: 20px;">
+                    <div class="nav">
+                        <a href="/logs">📋 Логи</a>
+                    </div>
                     <span>👤 ${username}</span>
                     <a href="/logout" class="logout">Выйти</a>
                 </div>
@@ -436,7 +443,6 @@ app.post('/add-bot', requireAuth, (req, res) => {
     
     if (!users[username].bots) users[username].bots = [];
     
-    // Проверяем, нет ли уже такого бота
     const exists = users[username].bots.find(b => b.username === bot_username);
     if (exists) {
         return res.redirect('/dashboard?error=Бот уже добавлен');
@@ -450,14 +456,6 @@ app.post('/add-bot', requireAuth, (req, res) => {
     saveUsers();
     
     log('[Bot] Added: @' + bot_username + ' for ' + username);
-    
-    // Пытаемся зарегистрировать на Яндекс.Диске
-    try {
-        botManager.registerBot(username, bot_token, bot_username);
-    } catch (e) {
-        // Игнорируем ошибки Яндекс.Диска
-    }
-    
     res.redirect('/dashboard');
 });
 
@@ -504,21 +502,163 @@ app.get('/browser', async (req, res) => {
     }
 });
 
-// ============ API ДЛЯ БОТОВ ============
-app.get('/api/bots', requireAuth, async (req, res) => {
+// ============ СТРАНИЦЫ БОТОВ ============
+app.get('/bot-chats/:botUsername', requireAuth, async (req, res) => {
+    const { botUsername } = req.params;
     const username = req.session.user.username;
     const user = users[username];
-    const bots = (user && user.bots) ? user.bots : [];
-    res.json({ bots });
+    
+    const bot = (user.bots || []).find(b => b.username === botUsername);
+    if (!bot) return res.redirect('/dashboard');
+    
+    let chats = [];
+    try {
+        chats = await botManager.getBotChats(botUsername);
+    } catch (e) {}
+    
+    let chatsHtml = '';
+    chats.forEach(chat => {
+        chatsHtml += `
+            <div class="card">
+                <span class="icon">💬</span>
+                <div class="info"><div class="name">@${chat.chat_id}</div></div>
+                <a href="/bot-chat/${botUsername}/${chat.chat_id}" class="btn">Открыть</a>
+            </div>`;
+    });
+    
+    res.send(`
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <meta charset="UTF-8">
+            <title>Чаты @${botUsername}</title>
+            <style>
+                body { font-family: Arial; background: #1a1a2e; color: #eee; margin: 0; }
+                .header { background: #00d4ff; padding: 20px; display: flex; justify-content: space-between; }
+                .header h1 { color: #1a1a2e; margin: 0; }
+                .container { max-width: 800px; margin: 30px auto; padding: 20px; }
+                .card { background: #3a3a5e; padding: 15px; border-radius: 10px; display: flex; align-items: center; gap: 15px; margin-bottom: 10px; }
+                .icon { font-size: 30px; }
+                .info { flex: 1; }
+                .name { font-weight: bold; }
+                .btn { background: #00d4ff; color: #1a1a2e; padding: 8px 15px; border-radius: 8px; text-decoration: none; }
+            </style>
+        </head>
+        <body>
+            <div class="header">
+                <h1>💬 Чаты @${botUsername}</h1>
+                <a href="/dashboard" style="color:#1a1a2e;text-decoration:none;padding:10px;background:rgba(0,0,0,0.1);border-radius:5px;">← Назад</a>
+            </div>
+            <div class="container">
+                ${chatsHtml || '<p style="opacity:0.5;">Нет чатов. Напишите боту в Telegram!</p>'}
+            </div>
+        </body>
+        </html>
+    `);
 });
 
-app.post('/api/bots/register', requireAuth, async (req, res) => {
+app.get('/bot-chat/:botUsername/:chatId', requireAuth, async (req, res) => {
+    const { botUsername, chatId } = req.params;
+    const username = req.session.user.username;
+    const user = users[username];
+    
+    const bot = (user.bots || []).find(b => b.username === botUsername);
+    if (!bot) return res.redirect('/dashboard');
+    
+    let messages = [];
+    try {
+        messages = await botManager.getChatMessages(botUsername, chatId, 50);
+    } catch (e) {}
+    
+    let messagesHtml = '';
+    messages.reverse().forEach(msg => {
+        const isSent = msg.status === 'sent';
+        const content = msg.text || msg.caption || `[${msg.type}]`;
+        const from = msg.from || (isSent ? 'Вы' : 'Пользователь');
+        const time = new Date(msg.timestamp).toLocaleTimeString();
+        
+        messagesHtml += `
+            <div class="message ${isSent ? 'sent' : 'received'}">
+                <div class="msg-from">${from}</div>
+                <div class="msg-text">${content}</div>
+                <div class="msg-time">${time}</div>
+            </div>`;
+    });
+    
+    res.send(`
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <meta charset="UTF-8">
+            <title>Чат @${chatId}</title>
+            <style>
+                body { font-family: Arial; background: #1a1a2e; color: #eee; margin: 0; }
+                .header { background: #00d4ff; padding: 15px; display: flex; justify-content: space-between; }
+                .header h1 { color: #1a1a2e; margin: 0; font-size: 20px; }
+                .container { max-width: 800px; margin: 0 auto; height: calc(100vh - 130px); overflow-y: auto; padding: 20px; }
+                .message { padding: 15px; border-radius: 15px; margin-bottom: 10px; max-width: 70%; }
+                .sent { background: #00d4ff; color: #1a1a2e; margin-left: auto; }
+                .received { background: #3a3a5e; }
+                .msg-from { font-size: 12px; opacity: 0.7; margin-bottom: 5px; }
+                .msg-text { font-size: 16px; }
+                .msg-time { font-size: 10px; opacity: 0.5; text-align: right; margin-top: 5px; }
+                .input-area { display: flex; padding: 15px; background: #2a2a4e; }
+                .input-area input { flex: 1; padding: 15px; background: #1a1a2e; border: 1px solid #444; border-radius: 10px; color: #fff; margin-right: 10px; }
+                .input-area button { padding: 15px 30px; background: #00d4ff; border: none; border-radius: 10px; font-weight: bold; cursor: pointer; }
+            </style>
+        </head>
+        <body>
+            <div class="header">
+                <h1>💬 @${chatId}</h1>
+                <a href="/bot-chats/${botUsername}" style="color:#1a1a2e;text-decoration:none;padding:10px;background:rgba(0,0,0,0.1);border-radius:5px;">← Назад</a>
+            </div>
+            <div class="container" id="messages">
+                ${messagesHtml || '<p style="opacity:0.5;text-align:center;">Нет сообщений</p>'}
+            </div>
+            <div class="input-area">
+                <input type="text" id="msgInput" placeholder="Сообщение...">
+                <button onclick="sendMsg()">📤</button>
+            </div>
+            <script>
+                async function sendMsg() {
+                    const text = document.getElementById('msgInput').value;
+                    if (!text) return;
+                    await fetch('/api/bots/${botUsername}/send', {
+                        method: 'POST',
+                        headers: {'Content-Type': 'application/json'},
+                        body: JSON.stringify({chat_id: '${chatId}', text: text})
+                    });
+                    document.getElementById('msgInput').value = '';
+                    location.reload();
+                }
+                setTimeout(() => location.reload(), 5000);
+            </script>
+        </body>
+        </html>
+    `);
+});
+
+// ============ API ============
+app.post('/fetch', (req, res) => {
+    res.status(202).json({ status: 'queued' });
+});
+
+app.get('/result', (req, res) => {
+    res.json({ status: 'processing' });
+});
+
+app.get('/api/bots', requireAuth, (req, res) => {
+    const username = req.session.user.username;
+    const user = users[username];
+    res.json({ bots: user?.bots || [] });
+});
+
+app.post('/api/bots/register', requireAuth, (req, res) => {
     const username = req.session.user.username;
     const { bot_username, bot_token } = req.body;
     
     if (!users[username].bots) users[username].bots = [];
     
-    // Проверяем, нет ли уже такого бота
     const exists = users[username].bots.find(b => b.username === bot_username);
     if (exists) {
         return res.json({ success: true, bot_username, status: 'already_exists' });
@@ -531,21 +671,15 @@ app.post('/api/bots/register', requireAuth, async (req, res) => {
     });
     saveUsers();
     
-    log('[API] Bot registered: @' + bot_username);
-    
     res.json({ success: true, bot_username });
 });
 
-app.delete('/api/bots/:botUsername', requireAuth, async (req, res) => {
+app.delete('/api/bots/:botUsername', requireAuth, (req, res) => {
     const username = req.session.user.username;
     const { botUsername } = req.params;
     
-    if (users[username].bots) {
-        users[username].bots = users[username].bots.filter(b => b.username !== botUsername);
-    }
+    users[username].bots = (users[username].bots || []).filter(b => b.username !== botUsername);
     saveUsers();
-    
-    log('[API] Bot deleted: @' + botUsername);
     
     res.json({ success: true });
 });
@@ -581,13 +715,11 @@ app.post('/api/bots/:botUsername/send', requireAuth, async (req, res) => {
     }
 });
 
-// ============ СТАРЫЙ API ============
-app.post('/fetch', (req, res) => {
-    res.status(202).json({ status: 'queued' });
-});
-
-app.get('/result', (req, res) => {
-    res.json({ status: 'processing' });
+app.get('/logs', requireAuth, (req, res) => {
+    let html = '<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Логи</title><style>body{font-family:monospace;background:#1a1a2e;color:#0f0;padding:20px;}a{color:#00d4ff;}pre{background:#0d0d1a;padding:20px;border-radius:10px;}</style></head><body><a href="/dashboard">← Назад</a><h1>📋 Логи</h1><pre>';
+    logs.slice().reverse().forEach(l => html += l + '\n');
+    html += '</pre></body></html>';
+    res.send(html);
 });
 
 app.get('/', (req, res) => {
@@ -595,7 +727,6 @@ app.get('/', (req, res) => {
     res.redirect('/login');
 });
 
-// ============ ЗАПУСК ============
 app.listen(PORT, () => {
     log('=== Server running on port ' + PORT + ' ===');
     log('=== Login: admin / admin123 ===');
