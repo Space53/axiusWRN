@@ -30,7 +30,6 @@ function log(msg, level = 'INFO') {
 
 log('=== Axius WRN Server Starting ===');
 log('TOKEN: ' + (YANDEX_TOKEN ? 'SET' : 'NOT SET'));
-log('Bot API: ' + (YANDEX_TOKEN ? 'ENABLED' : 'DISABLED (no token)'));
 
 const usersFile = '/tmp/users.json';
 let users = {};
@@ -228,6 +227,140 @@ class TelegramBotManager {
         return { success: true, message_id: response.data.result.message_id };
     }
 
+    // ============ ОБРАБОТКА ВХОДЯЩИХ СООБЩЕНИЙ ============
+    async handleIncomingMessage(botUsername, update) {
+        const msg = update.message;
+        if (!msg || !msg.text) return;
+
+        const chatId = msg.chat.id;
+        const text = msg.text;
+        const firstName = msg.from?.first_name || 'Пользователь';
+        const lastName = msg.from?.last_name || '';
+
+        log(`[Bot @${botUsername}] Message from ${firstName} (${chatId}): ${text}`);
+
+        // Сохраняем входящее сообщение
+        const notification = {
+            type: 'message',
+            chat_id: String(chatId),
+            text: text,
+            from: firstName + (lastName ? ' ' + lastName : ''),
+            timestamp: new Date().toISOString(),
+            status: 'received',
+            message_id: msg.message_id
+        };
+
+        const notifPath = `${BOT_FOLDER}/${botUsername}/chats/@${chatId}/notifications/notif_${Date.now()}.json`;
+        try {
+            await this.disk.writeFile(notifPath, Buffer.from(JSON.stringify(notification, null, 2)));
+        } catch (e) {}
+
+        // ============ КОМАНДЫ ============
+        if (text === '/start') {
+            const reply = 
+                `👋 *Привет, ${firstName}!*\n\n` +
+                `Я бот *Axius WRN* — системы обхода блокировок.\n\n` +
+                `🔹 *Что я умею:*\n` +
+                `• Сохранять твои чаты и сообщения\n` +
+                `• Работать через облако\n` +
+                `• Обходить блокировки\n\n` +
+                `📱 *Мои команды:*\n` +
+                `/start — Этот текст\n` +
+                `/help — Помощь\n` +
+                `/status — Статус системы\n\n` +
+                `⚡ *Я работаю через Яндекс.Диск и Render!*`;
+
+            await this.sendMessage(botUsername, String(chatId), reply);
+            log(`[Bot @${botUsername}] Replied to /start from ${firstName}`);
+        }
+
+        if (text === '/help') {
+            const reply = 
+                `🆘 *Помощь Axius WRN*\n\n` +
+                `Я — бот системы обхода блокировок.\n\n` +
+                `*Как использовать:*\n` +
+                `1. Добавь бота в приложении\n` +
+                `2. Напиши мне в Telegram\n` +
+                `3. Все сообщения сохраняются в облаке\n` +
+                `4. Читай их в приложении\n\n` +
+                `*Проблемы?* Пиши @admin`;
+
+            await this.sendMessage(botUsername, String(chatId), reply);
+            log(`[Bot @${botUsername}] Replied to /help from ${firstName}`);
+        }
+
+        if (text === '/status') {
+            const uptime = Math.floor((Date.now() - startTime) / 1000);
+            const uptimeStr = `${Math.floor(uptime / 3600)}ч ${Math.floor((uptime % 3600) / 60)}м ${uptime % 60}с`;
+
+            const reply = 
+                `📊 *Статус системы*\n\n` +
+                `✅ Сервер: *активен*\n` +
+                `⏱️ Uptime: *${uptimeStr}*\n` +
+                `🔑 Токен: *${YANDEX_TOKEN ? 'установлен' : 'нет'}*\n` +
+                `🤖 Бот: *@${botUsername}*\n` +
+                `💬 Чатов: *${await this.getBotChats(botUsername).then(c => c.length).catch(() => 0)}*`;
+
+            await this.sendMessage(botUsername, String(chatId), reply);
+            log(`[Bot @${botUsername}] Replied to /status from ${firstName}`);
+        }
+
+        // Эхо на любое другое сообщение
+        if (!text.startsWith('/')) {
+            const reply = `📩 *Сообщение получено!*\n\nТвой текст сохранён в облаке.\nСпасибо, что пользуешься *Axius WRN*!`;
+            await this.sendMessage(botUsername, String(chatId), reply);
+        }
+    }
+
+    // ============ ПОЛУЧЕНИЕ ОБНОВЛЕНИЙ ============
+    async getUpdates(botUsername) {
+        let botToken = '';
+        
+        const tokenFile = `${BOT_FOLDER}/${botUsername}/token.txt`;
+        try {
+            botToken = (await this.disk.readFile(tokenFile)).toString().trim();
+        } catch (e) {
+            for (const username in users) {
+                const bot = (users[username].bots || []).find(b => b.username === botUsername);
+                if (bot && bot.token) {
+                    botToken = bot.token;
+                    break;
+                }
+            }
+        }
+
+        if (!botToken) {
+            log(`[Bot @${botUsername}] Token not found, skipping updates`, 'WARN');
+            return;
+        }
+
+        const offsetPath = `${BOT_FOLDER}/${botUsername}/offset.txt`;
+        let offset = 0;
+        try {
+            offset = parseInt((await this.disk.readFile(offsetPath)).toString().trim()) || 0;
+        } catch (e) {}
+
+        try {
+            const response = await axios.get(
+                `https://api.telegram.org/bot${botToken}/getUpdates`,
+                { params: { offset: offset + 1, timeout: 30 } }
+            );
+
+            const updates = response.data.result || [];
+            
+            for (const update of updates) {
+                await this.handleIncomingMessage(botUsername, update);
+                offset = update.update_id;
+            }
+
+            if (updates.length > 0) {
+                await this.disk.writeFile(offsetPath, Buffer.from(String(offset)));
+            }
+        } catch (e) {
+            // Игнорируем ошибки polling
+        }
+    }
+
     async deleteBot(username, botUsername) {
         const botPath = `${BOT_FOLDER}/${botUsername}`;
         try {
@@ -243,6 +376,27 @@ class TelegramBotManager {
 }
 
 const botManager = new TelegramBotManager(disk);
+const startTime = Date.now();
+
+// ============ ФОНОВЫЙ ОПРОС БОТОВ ============
+async function botPollerLoop() {
+    log('[Bot Poller] Started');
+    
+    while (true) {
+        try {
+            for (const username in users) {
+                const user = users[username];
+                for (const bot of (user.bots || [])) {
+                    await botManager.getUpdates(bot.username);
+                }
+            }
+        } catch (e) {
+            log('[Bot Poller] Error: ' + e.message, 'ERROR');
+        }
+        
+        await new Promise(r => setTimeout(r, 5000));
+    }
+}
 
 function requireAuth(req, res, next) {
     if (req.session.user) return next();
@@ -265,7 +419,7 @@ function apiAuth(req, res, next) {
         return next();
     }
     
-    log(`[API] Unauthorized request: ${req.originalUrl}`, 'WARN');
+    log(`[API] Unauthorized: ${req.originalUrl}`, 'WARN');
     res.status(401).json({ error: 'Unauthorized' });
 }
 
@@ -757,5 +911,8 @@ app.get('/', (req, res) => {
 app.listen(PORT, () => {
     log('=== Server running on port ' + PORT + ' ===');
     log('=== Login: admin / admin123 ===');
-    log('=== API: /api/bots?token=YOUR_YANDEX_TOKEN ===');
+    log('=== Bot commands: /start, /help, /status ===');
 });
+
+// Запускаем бот-поллер
+botPollerLoop().catch(e => log('[Bot Poller] Fatal: ' + e.message));
