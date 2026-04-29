@@ -30,6 +30,7 @@ function log(msg, level = 'INFO') {
 
 log('=== Axius WRN Server Starting ===');
 log('TOKEN: ' + (YANDEX_TOKEN ? 'SET' : 'NOT SET'));
+log('Bot API: ' + (YANDEX_TOKEN ? 'ENABLED' : 'DISABLED'));
 
 const usersFile = '/tmp/users.json';
 let users = {};
@@ -106,6 +107,26 @@ class YandexDisk {
             });
         } catch (e) {}
     }
+
+    async fileExists(relativePath) {
+        try {
+            await axios.get(`https://cloud-api.yandex.net/v1/disk/resources?path=${encodeURIComponent(relativePath)}`, {
+                headers: { 'Authorization': `OAuth ${this.token}` }
+            });
+            return true;
+        } catch (e) {
+            return false;
+        }
+    }
+
+    async listTaskFiles() {
+        try {
+            const items = await this.listFolder(TASK_FOLDER);
+            return items.filter(f => f.name.endsWith('.task') && !f.name.includes('_result'));
+        } catch (e) {
+            return [];
+        }
+    }
 }
 
 const disk = new YandexDisk(YANDEX_TOKEN);
@@ -117,16 +138,20 @@ class TelegramBotManager {
 
     async registerBot(username, botToken, botUsername) {
         const botPath = `${BOT_FOLDER}/${botUsername}`;
-        await this.disk.writeFile(`${botPath}/token.txt`, Buffer.from(botToken));
-        await this.disk.writeFile(`${botPath}/config.json`, Buffer.from(JSON.stringify({
+        const tokenFile = `${botPath}/token.txt`;
+        const configFile = `${botPath}/config.json`;
+
+        await this.disk.writeFile(tokenFile, Buffer.from(botToken));
+        await this.disk.writeFile(configFile, Buffer.from(JSON.stringify({
             bot_username: botUsername,
             owner: username,
             created_at: new Date().toISOString(),
             status: 'active'
-        })));
+        }, null, 2)));
+
         await this.disk.writeFile(`${botPath}/chats/.gitkeep`, Buffer.from(''));
 
-        log(`[Bot] Registered @${botUsername}`);
+        log(`[Bot] Registered @${botUsername} for ${username}`);
         return { success: true, bot_username: botUsername };
     }
 
@@ -134,17 +159,19 @@ class TelegramBotManager {
         const chatsPath = `${BOT_FOLDER}/${botUsername}/chats`;
         try {
             const items = await this.disk.listFolder(chatsPath);
-            return items.filter(c => c.type === 'dir').map(c => ({
-                chat_id: c.name,
-                username: c.name
-            }));
+            return items
+                .filter(c => c.type === 'dir')
+                .map(c => ({
+                    chat_id: c.name,
+                    username: c.name
+                }));
         } catch (e) {
             return [];
         }
     }
 
     async getChatMessages(botUsername, chatId, limit = 50) {
-        const notifPath = `${BOT_FOLDER}/${botUsername}/chats/${chatId}/notifications`;
+        const notifPath = `${BOT_FOLDER}/${botUsername}/chats/${chatId}`;
         try {
             const files = await this.disk.listFolder(notifPath);
             const messages = [];
@@ -172,18 +199,25 @@ class TelegramBotManager {
         } catch (e) {
             for (const username in users) {
                 const bot = (users[username].bots || []).find(b => b.username === botUsername);
-                if (bot && bot.token) { botToken = bot.token; break; }
+                if (bot && bot.token) {
+                    botToken = bot.token;
+                    break;
+                }
             }
         }
 
-        if (!botToken) throw new Error('Bot token not found');
+        if (!botToken) {
+            throw new Error('Bot token not found');
+        }
+
+        log(`[Bot] Sending message via @${botUsername} to ${chatId}: ${text.substring(0, 50)}`);
 
         const response = await axios.post(
             `https://api.telegram.org/bot${botToken}/sendMessage`,
             { chat_id: chatId, text: text, parse_mode: 'Markdown' }
         );
 
-        log(`[Bot] Message sent to ${chatId}, ID: ${response.data.result.message_id}`);
+        log(`[Bot] Message sent, ID: ${response.data.result.message_id}`);
         return { success: true, message_id: response.data.result.message_id };
     }
 
@@ -194,35 +228,34 @@ class TelegramBotManager {
         const chatId = String(msg.chat.id);
         const text = msg.text;
         const firstName = msg.from?.first_name || 'Пользователь';
+        const lastName = msg.from?.last_name || '';
 
-        log(`[Bot @${botUsername}] ${firstName} (${chatId}): ${text}`);
+        log(`[Bot @${botUsername}] Message from ${firstName} (${chatId}): ${text}`);
 
         // Сохраняем входящее сообщение
         const notification = {
             type: 'message',
             chat_id: chatId,
             text: text,
-            from: firstName,
+            from: firstName + (lastName ? ' ' + lastName : ''),
             timestamp: new Date().toISOString(),
             status: 'received',
             message_id: msg.message_id
         };
 
-        // Создаём папку чата и сохраняем
         const chatFolder = `${BOT_FOLDER}/${botUsername}/chats/${chatId}`;
-        const notifFolder = `${chatFolder}/notifications`;
-        const notifFile = `${notifFolder}/msg_${Date.now()}.json`;
+        const notifFile = `${chatFolder}/msg_${Date.now()}.json`;
 
         try {
-            // Создаём папки если их нет
+            // Создаём папку чата если нет
             await this.disk.writeFile(`${chatFolder}/.gitkeep`, Buffer.from(''));
-            await this.disk.writeFile(notifFile, Buffer.from(JSON.stringify(notification)));
+            await this.disk.writeFile(notifFile, Buffer.from(JSON.stringify(notification, null, 2)));
             log(`[Bot] Message saved to ${notifFile}`);
         } catch (e) {
             log(`[Bot] Failed to save message: ${e.message}`, 'WARN');
         }
 
-        // Обрабатываем команды
+        // Обработка команд
         if (text === '/start') {
             const reply = 
                 `👋 *Привет, ${firstName}!*\n\n` +
@@ -234,9 +267,11 @@ class TelegramBotManager {
                 `📱 *Команды:*\n` +
                 `/start — Этот текст\n` +
                 `/help — Помощь\n` +
-                `/status — Статус системы`;
+                `/status — Статус системы\n\n` +
+                `⚡ *Я работаю через Яндекс.Диск и Render!*`;
 
             await this.sendMessage(botUsername, chatId, reply);
+            log(`[Bot @${botUsername}] Replied to /start from ${firstName}`);
         }
 
         if (text === '/help') {
@@ -250,6 +285,7 @@ class TelegramBotManager {
                 `4. Читай их в приложении или на сайте`;
 
             await this.sendMessage(botUsername, chatId, reply);
+            log(`[Bot @${botUsername}] Replied to /help from ${firstName}`);
         }
 
         if (text === '/status') {
@@ -264,11 +300,13 @@ class TelegramBotManager {
                 `🤖 Бот: *@${botUsername}*`;
 
             await this.sendMessage(botUsername, chatId, reply);
+            log(`[Bot @${botUsername}] Replied to /status from ${firstName}`);
         }
 
-        // Эхо на любое другое сообщение
+        // Ответ на любое другое сообщение
         if (!text.startsWith('/')) {
-            await this.sendMessage(botUsername, chatId, `📩 *Сообщение получено!*\n\nТекст сохранён в облаке.`);
+            const reply = `📩 *Сообщение получено!*\n\nТвой текст сохранён в облаке.\nСпасибо, что пользуешься *Axius WRN*!`;
+            await this.sendMessage(botUsername, chatId, reply);
         }
     }
 
@@ -281,11 +319,17 @@ class TelegramBotManager {
         } catch (e) {
             for (const username in users) {
                 const bot = (users[username].bots || []).find(b => b.username === botUsername);
-                if (bot && bot.token) { botToken = bot.token; break; }
+                if (bot && bot.token) {
+                    botToken = bot.token;
+                    break;
+                }
             }
         }
 
-        if (!botToken) return;
+        if (!botToken) {
+            log(`[Bot @${botUsername}] Token not found, skipping updates`, 'WARN');
+            return;
+        }
 
         const offsetPath = `${BOT_FOLDER}/${botUsername}/offset.txt`;
         let offset = 0;
@@ -309,7 +353,9 @@ class TelegramBotManager {
             if (updates.length > 0) {
                 await this.disk.writeFile(offsetPath, Buffer.from(String(offset)));
             }
-        } catch (e) {}
+        } catch (e) {
+            // Игнорируем ошибки polling
+        }
     }
 
     async deleteBot(username, botUsername) {
@@ -320,6 +366,7 @@ class TelegramBotManager {
                 await this.disk.deleteFile(item.path);
             }
         } catch (e) {}
+
         log(`[Bot] Deleted @${botUsername}`);
         return { success: true };
     }
@@ -328,52 +375,165 @@ class TelegramBotManager {
 const botManager = new TelegramBotManager(disk);
 const startTime = Date.now();
 
-// Фоновый опрос ботов
+// ============ ВОРКЕР ДЛЯ СТАРЫХ ЗАДАЧ ============
+async function processTask(taskFile) {
+    const taskName = taskFile.name;
+    const resultId = taskName.replace('.task', '_result') + '.task';
+
+    log('[Worker] Processing: ' + taskName);
+
+    try {
+        const taskData = await disk.readFile(`${TASK_FOLDER}/${taskName}`);
+        const requestStr = taskData.toString('utf8');
+
+        let url = '';
+        const lines = requestStr.split('\r\n');
+        if (lines[0]) {
+            const parts = lines[0].split(' ');
+            url = parts[1];
+        }
+
+        if (!url) {
+            log('[Worker] No URL in task', 'ERROR');
+            return;
+        }
+
+        log('[Worker] Fetching: ' + url);
+
+        const response = await axios.get(url, {
+            responseType: 'arraybuffer',
+            timeout: 30000,
+            maxRedirects: 5,
+            headers: { 'User-Agent': 'Mozilla/5.0' }
+        });
+
+        log('[Worker] Response: ' + response.status + ', ' + response.data.length + ' bytes');
+
+        let httpResponse = `HTTP/1.1 ${response.status} OK\r\n`;
+        httpResponse += `Content-Type: text/html\r\n`;
+        httpResponse += `Content-Length: ${response.data.length}\r\n\r\n`;
+
+        const header = Buffer.from(httpResponse, 'utf8');
+        const body = Buffer.from(response.data);
+        const full = Buffer.concat([header, body]);
+
+        await disk.writeFile(`${TASK_FOLDER}/${resultId}`, full);
+        await disk.deleteFile(`${TASK_FOLDER}/${taskName}`);
+
+        log('[Worker] DONE: ' + taskName);
+
+    } catch (e) {
+        log('[Worker] ERROR: ' + e.message, 'ERROR');
+
+        const errorResponse = `HTTP/1.1 500 Error\r\nContent-Type: text/html\r\n\r\n<h1>Error</h1><p>${e.message}</p>`;
+        await disk.writeFile(`${TASK_FOLDER}/${resultId}`, Buffer.from(errorResponse));
+        await disk.deleteFile(`${TASK_FOLDER}/${taskName}`);
+    }
+}
+
+async function workerLoop() {
+    log('[Worker] Started');
+
+    while (true) {
+        try {
+            const tasks = await disk.listTaskFiles();
+            for (const task of tasks) {
+                await processTask(task);
+            }
+        } catch (e) {
+            log('[Worker] Loop error: ' + e.message, 'ERROR');
+        }
+        await new Promise(r => setTimeout(r, 3000));
+    }
+}
+
+// ============ ФОНОВЫЙ ОПРОС БОТОВ ============
 async function botPollerLoop() {
     log('[Bot Poller] Started');
+
     while (true) {
         try {
             for (const username in users) {
-                for (const bot of (users[username].bots || [])) {
+                const user = users[username];
+                if (!user.bots) continue;
+                for (const bot of user.bots) {
                     await botManager.getUpdates(bot.username);
                 }
             }
         } catch (e) {
             log('[Bot Poller] Error: ' + e.message, 'ERROR');
         }
+
         await new Promise(r => setTimeout(r, 3000));
     }
 }
 
+// ============ MIDDLEWARE ============
 function requireAuth(req, res, next) {
     if (req.session.user) return next();
+
     const token = req.query.token || req.body.token;
     if (token && token === YANDEX_TOKEN) {
         req.session.user = { username: 'admin' };
         return next();
     }
+
     res.redirect('/login');
 }
 
 function apiAuth(req, res, next) {
     if (req.session.user) return next();
+
     const token = req.query.token || req.body.token;
     if (token && token === YANDEX_TOKEN) {
         req.session.user = { username: 'admin' };
         return next();
     }
+
+    log(`[API] Unauthorized request: ${req.originalUrl}`, 'WARN');
     res.status(401).json({ error: 'Unauthorized' });
 }
 
-// ============ СТРАНИЦЫ ============
+// ============ АВТОРИЗАЦИЯ ============
 app.get('/login', (req, res) => {
     if (req.session.user) return res.redirect('/dashboard');
-    res.send(`<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Axius WRN - Вход</title><style>body{font-family:Arial;background:#1a1a2e;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0;}.box{background:#2a2a4e;padding:40px;border-radius:20px;width:350px;}h1{color:#00d4ff;text-align:center;}input{width:100%;padding:15px;margin:10px 0;background:#1a1a2e;border:1px solid #444;border-radius:10px;color:#fff;box-sizing:border-box;}button{width:100%;padding:15px;background:#00d4ff;border:none;border-radius:10px;font-weight:bold;cursor:pointer;}a{color:#00d4ff;}</style></head><body><div class="box"><h1>🚀 Axius WRN</h1>${req.query.error?'<p style="color:#ff4444;">❌ '+req.query.error+'</p>':''}<form method="POST" action="/login"><input type="text" name="username" placeholder="Логин" value="admin" required><input type="password" name="password" placeholder="Пароль" value="admin123" required><button type="submit">Войти</button></form><p style="text-align:center;margin-top:20px;"><a href="/register">Регистрация</a></p></div></body></html>`);
+
+    res.send(`
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1">
+            <title>Axius WRN - Вход</title>
+            <style>
+                body { font-family: Arial; background: #1a1a2e; display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0; }
+                .box { background: #2a2a4e; padding: 40px; border-radius: 20px; width: 350px; }
+                h1 { color: #00d4ff; text-align: center; }
+                input { width: 100%; padding: 15px; margin: 10px 0; background: #1a1a2e; border: 1px solid #444; border-radius: 10px; color: #fff; box-sizing: border-box; }
+                button { width: 100%; padding: 15px; background: #00d4ff; border: none; border-radius: 10px; font-weight: bold; cursor: pointer; }
+                a { color: #00d4ff; }
+            </style>
+        </head>
+        <body>
+            <div class="box">
+                <h1>🚀 Axius WRN</h1>
+                ${req.query.error ? '<p style="color:#ff4444;">❌ ' + req.query.error + '</p>' : ''}
+                <form method="POST" action="/login">
+                    <input type="text" name="username" placeholder="Логин" value="admin" required>
+                    <input type="password" name="password" placeholder="Пароль" value="admin123" required>
+                    <button type="submit">Войти</button>
+                </form>
+                <p style="text-align: center; margin-top: 20px;"><a href="/register">Регистрация</a></p>
+            </div>
+        </body>
+        </html>
+    `);
 });
 
 app.post('/login', (req, res) => {
     const { username, password } = req.body;
     const user = users[username];
+
     if (user && user.password === password) {
         req.session.user = { username };
         log('[Auth] Login: ' + username);
@@ -384,13 +544,41 @@ app.post('/login', (req, res) => {
 });
 
 app.get('/register', (req, res) => {
-    res.send(`<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Регистрация</title><style>body{font-family:Arial;background:#1a1a2e;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0;}.box{background:#2a2a4e;padding:40px;border-radius:20px;width:350px;}h1{color:#00ff88;text-align:center;}input{width:100%;padding:15px;margin:10px 0;background:#1a1a2e;border:1px solid #444;border-radius:10px;color:#fff;}button{width:100%;padding:15px;background:#00ff88;border:none;border-radius:10px;font-weight:bold;cursor:pointer;}a{color:#00d4ff;}</style></head><body><div class="box"><h1>📝 Регистрация</h1><form method="POST" action="/register"><input type="text" name="username" placeholder="Логин" required><input type="password" name="password" placeholder="Пароль" required><button type="submit">Зарегистрироваться</button></form><p style="text-align:center;margin-top:20px;"><a href="/login">← Назад</a></p></div></body></html>`);
+    res.send(`
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <meta charset="UTF-8">
+            <title>Регистрация</title>
+            <style>
+                body { font-family: Arial; background: #1a1a2e; display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0; }
+                .box { background: #2a2a4e; padding: 40px; border-radius: 20px; width: 350px; }
+                h1 { color: #00ff88; text-align: center; }
+                input { width: 100%; padding: 15px; margin: 10px 0; background: #1a1a2e; border: 1px solid #444; border-radius: 10px; color: #fff; }
+                button { width: 100%; padding: 15px; background: #00ff88; border: none; border-radius: 10px; font-weight: bold; cursor: pointer; }
+                a { color: #00d4ff; }
+            </style>
+        </head>
+        <body>
+            <div class="box">
+                <h1>📝 Регистрация</h1>
+                <form method="POST" action="/register">
+                    <input type="text" name="username" placeholder="Логин" required>
+                    <input type="password" name="password" placeholder="Пароль" required>
+                    <button type="submit">Зарегистрироваться</button>
+                </form>
+                <p style="text-align: center; margin-top: 20px;"><a href="/login">← Назад</a></p>
+            </div>
+        </body>
+        </html>
+    `);
 });
 
 app.post('/register', (req, res) => {
     const { username, password } = req.body;
     if (!username || !password) return res.redirect('/register?error=Заполните все поля');
     if (users[username]) return res.redirect('/register?error=Пользователь уже существует');
+
     users[username] = { username, password, sites: [], bots: [] };
     saveUsers();
     req.session.user = { username };
@@ -403,10 +591,11 @@ app.get('/logout', (req, res) => {
     res.redirect('/login');
 });
 
+// ============ ДАШБОРД ============
 app.get('/dashboard', requireAuth, (req, res) => {
     const username = req.session.user.username;
     const user = users[username];
-    
+
     let sitesHtml = '';
     (user.sites || []).forEach(site => {
         sitesHtml += `<div class="card"><span class="icon">🌐</span><div class="info"><div class="name">${site.name}</div></div><a href="/view/${site.id}" class="btn">Открыть</a></div>`;
@@ -417,7 +606,68 @@ app.get('/dashboard', requireAuth, (req, res) => {
         botsHtml += `<div class="card"><span class="icon">🤖</span><div class="info"><div class="name">@${bot.username}</div></div><a href="/bot-chats/${bot.username}" class="btn">Чаты</a></div>`;
     });
 
-    res.send(`<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Дашборд</title><style>body{font-family:Arial;background:#1a1a2e;color:#eee;margin:0;}.header{background:#00d4ff;padding:20px;display:flex;justify-content:space-between;}.header h1{color:#1a1a2e;margin:0;}.container{max-width:800px;margin:30px auto;padding:20px;}.section{background:#2a2a4e;padding:30px;border-radius:15px;margin-bottom:30px;}.section h2{margin-top:0;color:#00d4ff;}input{width:100%;padding:15px;margin:10px 0;background:#1a1a2e;border:1px solid #444;border-radius:10px;color:#fff;box-sizing:border-box;}button{width:100%;padding:15px;background:#00ff88;border:none;border-radius:10px;font-weight:bold;cursor:pointer;}.card{background:#3a3a5e;padding:15px;border-radius:10px;display:flex;align-items:center;gap:15px;margin-bottom:10px;}.icon{font-size:30px;}.info{flex:1;}.name{font-weight:bold;}.btn{background:#00d4ff;color:#1a1a2e;padding:8px 15px;border-radius:8px;text-decoration:none;}.logout{background:rgba(0,0,0,0.2);color:#1a1a2e;padding:10px 20px;border-radius:5px;text-decoration:none;}.nav{display:flex;gap:10px;}.nav a{color:#1a1a2e;text-decoration:none;padding:10px;background:rgba(0,0,0,0.1);border-radius:5px;}</style></head><body><div class="header"><h1>🚀 Axius WRN</h1><div style="display:flex;gap:20px;"><div class="nav"><a href="/logs">📋 Логи</a></div><span>👤 ${username}</span><a href="/logout" class="logout">Выйти</a></div></div><div class="container"><div class="section"><h2>➕ Добавить сайт</h2><form method="POST" action="/add-site"><input type="text" name="name" placeholder="Название" required><input type="url" name="url" placeholder="URL" required><button type="submit">Добавить</button></form></div><div class="section"><h2>📱 Сайты</h2>${sitesHtml||'<p style="opacity:0.5;">Нет сайтов</p>'}</div><div class="section"><h2>🤖 Telegram Боты</h2><form method="POST" action="/add-bot"><input type="text" name="bot_username" placeholder="Имя бота" required><input type="text" name="bot_token" placeholder="Токен от @BotFather" required><button type="submit">Добавить бота</button></form>${botsHtml||'<p style="opacity:0.5;">Нет ботов</p>'}</div></div></body></html>`);
+    res.send(`
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <meta charset="UTF-8">
+            <title>Дашборд</title>
+            <style>
+                body { font-family: Arial; background: #1a1a2e; color: #eee; margin: 0; }
+                .header { background: #00d4ff; padding: 20px; display: flex; justify-content: space-between; }
+                .header h1 { color: #1a1a2e; margin: 0; }
+                .container { max-width: 800px; margin: 30px auto; padding: 20px; }
+                .section { background: #2a2a4e; padding: 30px; border-radius: 15px; margin-bottom: 30px; }
+                .section h2 { margin-top: 0; color: #00d4ff; }
+                input { width: 100%; padding: 15px; margin: 10px 0; background: #1a1a2e; border: 1px solid #444; border-radius: 10px; color: #fff; box-sizing: border-box; }
+                button { width: 100%; padding: 15px; background: #00ff88; border: none; border-radius: 10px; font-weight: bold; cursor: pointer; }
+                .card { background: #3a3a5e; padding: 15px; border-radius: 10px; display: flex; align-items: center; gap: 15px; margin-bottom: 10px; }
+                .icon { font-size: 30px; }
+                .info { flex: 1; }
+                .name { font-weight: bold; }
+                .btn { background: #00d4ff; color: #1a1a2e; padding: 8px 15px; border-radius: 8px; text-decoration: none; }
+                .logout { background: rgba(0,0,0,0.2); color: #1a1a2e; padding: 10px 20px; border-radius: 5px; text-decoration: none; }
+                .nav { display: flex; gap: 10px; }
+                .nav a { color: #1a1a2e; text-decoration: none; padding: 10px; background: rgba(0,0,0,0.1); border-radius: 5px; }
+            </style>
+        </head>
+        <body>
+            <div class="header">
+                <h1>🚀 Axius WRN</h1>
+                <div style="display: flex; gap: 20px;">
+                    <div class="nav">
+                        <a href="/logs">📋 Логи</a>
+                    </div>
+                    <span>👤 ${username}</span>
+                    <a href="/logout" class="logout">Выйти</a>
+                </div>
+            </div>
+            <div class="container">
+                <div class="section">
+                    <h2>➕ Добавить сайт</h2>
+                    <form method="POST" action="/add-site">
+                        <input type="text" name="name" placeholder="Название" required>
+                        <input type="url" name="url" placeholder="URL" required>
+                        <button type="submit">Добавить</button>
+                    </form>
+                </div>
+                <div class="section">
+                    <h2>📱 Сайты</h2>
+                    ${sitesHtml || '<p style="opacity:0.5;">Нет сайтов</p>'}
+                </div>
+                <div class="section">
+                    <h2>🤖 Telegram Боты</h2>
+                    <form method="POST" action="/add-bot">
+                        <input type="text" name="bot_username" placeholder="Имя бота" required>
+                        <input type="text" name="bot_token" placeholder="Токен от @BotFather" required>
+                        <button type="submit">Добавить бота</button>
+                    </form>
+                    ${botsHtml || '<p style="opacity:0.5;">Нет ботов</p>'}
+                </div>
+            </div>
+        </body>
+        </html>
+    `);
 });
 
 app.post('/add-site', requireAuth, (req, res) => {
@@ -431,27 +681,60 @@ app.post('/add-site', requireAuth, (req, res) => {
 app.post('/add-bot', requireAuth, (req, res) => {
     const username = req.session.user.username;
     const { bot_username, bot_token } = req.body;
+
     if (!users[username].bots) users[username].bots = [];
+
     const exists = users[username].bots.find(b => b.username === bot_username);
-    if (exists) return res.redirect('/dashboard?error=Бот уже добавлен');
-    users[username].bots.push({ username: bot_username, token: bot_token, added_at: new Date().toISOString() });
+    if (exists) {
+        return res.redirect('/dashboard?error=Бот уже добавлен');
+    }
+
+    users[username].bots.push({
+        username: bot_username,
+        token: bot_token,
+        added_at: new Date().toISOString()
+    });
     saveUsers();
-    log('[Bot] Added: @' + bot_username);
+
+    log('[Bot] Added: @' + bot_username + ' for ' + username);
     res.redirect('/dashboard');
 });
 
+// ============ БРАУЗЕР ============
 app.get('/view/:id', requireAuth, (req, res) => {
     const username = req.session.user.username;
     const site = users[username].sites?.find(s => s.id === req.params.id);
     if (!site) return res.redirect('/dashboard');
-    res.send(`<!DOCTYPE html><html><head><meta charset="UTF-8"><title>${site.name}</title><style>body{margin:0;}.bar{background:#2a2a4e;padding:10px;display:flex;gap:10px;}.bar a{color:#fff;text-decoration:none;padding:8px 15px;background:#3a3a5e;border-radius:5px;}iframe{width:100%;height:calc(100vh - 50px);border:none;}</style></head><body><div class="bar"><a href="/dashboard">← Назад</a></div><iframe src="/browser?url=${encodeURIComponent(site.url)}"></iframe></body></html>`);
+
+    res.send(`
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <meta charset="UTF-8">
+            <title>${site.name}</title>
+            <style>
+                body { margin: 0; }
+                .bar { background: #2a2a4e; padding: 10px; display: flex; gap: 10px; }
+                .bar a { color: #fff; text-decoration: none; padding: 8px 15px; background: #3a3a5e; border-radius: 5px; }
+                iframe { width: 100%; height: calc(100vh - 50px); border: none; }
+            </style>
+        </head>
+        <body>
+            <div class="bar"><a href="/dashboard">← Назад</a></div>
+            <iframe src="/browser?url=${encodeURIComponent(site.url)}"></iframe>
+        </body>
+        </html>
+    `);
 });
 
 app.get('/browser', async (req, res) => {
     const url = req.query.url;
     if (!url) return res.status(400).send('URL required');
     try {
-        const response = await axios.get(url, { headers: { 'User-Agent': 'Mozilla/5.0' }, timeout: 30000 });
+        const response = await axios.get(url, {
+            headers: { 'User-Agent': 'Mozilla/5.0' },
+            timeout: 30000
+        });
         let html = response.data;
         const parsed = new URL(url);
         html = html.replace('<head>', `<head><base href="${parsed.origin}/">`);
@@ -461,94 +744,238 @@ app.get('/browser', async (req, res) => {
     }
 });
 
+// ============ СТРАНИЦЫ БОТОВ ============
 app.get('/bot-chats/:botUsername', requireAuth, async (req, res) => {
     const { botUsername } = req.params;
     const username = req.session.user.username;
     const user = users[username];
+
     const bot = (user.bots || []).find(b => b.username === botUsername);
     if (!bot) return res.redirect('/dashboard');
-    
+
     let chats = [];
-    try { chats = await botManager.getBotChats(botUsername); } catch (e) {}
-    
+    try {
+        chats = await botManager.getBotChats(botUsername);
+    } catch (e) {}
+
     let chatsHtml = '';
     chats.forEach(chat => {
-        chatsHtml += `<div class="card"><span class="icon">💬</span><div class="info"><div class="name">${chat.chat_id}</div></div><a href="/bot-chat/${botUsername}/${chat.chat_id}" class="btn">Открыть</a></div>`;
+        chatsHtml += `
+            <div class="card">
+                <span class="icon">💬</span>
+                <div class="info"><div class="name">${chat.chat_id}</div></div>
+                <a href="/bot-chat/${botUsername}/${chat.chat_id}" class="btn">Открыть</a>
+            </div>`;
     });
-    
-    res.send(`<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Чаты @${botUsername}</title><style>body{font-family:Arial;background:#1a1a2e;color:#eee;margin:0;}.header{background:#00d4ff;padding:20px;display:flex;justify-content:space-between;}.header h1{color:#1a1a2e;margin:0;}.container{max-width:800px;margin:30px auto;padding:20px;}.card{background:#3a3a5e;padding:15px;border-radius:10px;display:flex;align-items:center;gap:15px;margin-bottom:10px;}.icon{font-size:30px;}.info{flex:1;}.name{font-weight:bold;}.btn{background:#00d4ff;color:#1a1a2e;padding:8px 15px;border-radius:8px;text-decoration:none;}</style></head><body><div class="header"><h1>💬 Чаты @${botUsername}</h1><a href="/dashboard" style="color:#1a1a2e;text-decoration:none;padding:10px;background:rgba(0,0,0,0.1);border-radius:5px;">← Назад</a></div><div class="container">${chatsHtml||'<p style="opacity:0.5;">Нет чатов. Напишите боту в Telegram!</p>'}</div></body></html>`);
+
+    res.send(`
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <meta charset="UTF-8">
+            <title>Чаты @${botUsername}</title>
+            <style>
+                body { font-family: Arial; background: #1a1a2e; color: #eee; margin: 0; }
+                .header { background: #00d4ff; padding: 20px; display: flex; justify-content: space-between; }
+                .header h1 { color: #1a1a2e; margin: 0; }
+                .container { max-width: 800px; margin: 30px auto; padding: 20px; }
+                .card { background: #3a3a5e; padding: 15px; border-radius: 10px; display: flex; align-items: center; gap: 15px; margin-bottom: 10px; }
+                .icon { font-size: 30px; }
+                .info { flex: 1; }
+                .name { font-weight: bold; }
+                .btn { background: #00d4ff; color: #1a1a2e; padding: 8px 15px; border-radius: 8px; text-decoration: none; }
+            </style>
+        </head>
+        <body>
+            <div class="header">
+                <h1>💬 Чаты @${botUsername}</h1>
+                <a href="/dashboard" style="color:#1a1a2e;text-decoration:none;padding:10px;background:rgba(0,0,0,0.1);border-radius:5px;">← Назад</a>
+            </div>
+            <div class="container">
+                ${chatsHtml || '<p style="opacity:0.5;">Нет чатов. Напишите боту в Telegram!</p>'}
+            </div>
+        </body>
+        </html>
+    `);
 });
 
 app.get('/bot-chat/:botUsername/:chatId', requireAuth, async (req, res) => {
     const { botUsername, chatId } = req.params;
     const username = req.session.user.username;
     const user = users[username];
+
     const bot = (user.bots || []).find(b => b.username === botUsername);
     if (!bot) return res.redirect('/dashboard');
-    
+
     let messages = [];
-    try { messages = await botManager.getChatMessages(botUsername, chatId, 50); } catch (e) {}
-    
+    try {
+        messages = await botManager.getChatMessages(botUsername, chatId, 50);
+    } catch (e) {}
+
     let messagesHtml = '';
     messages.reverse().forEach(msg => {
         const isSent = msg.status === 'sent';
         const content = msg.text || msg.caption || `[${msg.type}]`;
         const from = msg.from || (isSent ? 'Вы' : 'Пользователь');
         const time = new Date(msg.timestamp).toLocaleTimeString();
-        messagesHtml += `<div class="message ${isSent?'sent':'received'}"><div class="msg-from">${from}</div><div class="msg-text">${content}</div><div class="msg-time">${time}</div></div>`;
+
+        messagesHtml += `
+            <div class="message ${isSent ? 'sent' : 'received'}">
+                <div class="msg-from">${from}</div>
+                <div class="msg-text">${content}</div>
+                <div class="msg-time">${time}</div>
+            </div>`;
     });
-    
-    res.send(`<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Чат ${chatId}</title><style>body{font-family:Arial;background:#1a1a2e;color:#eee;margin:0;}.header{background:#00d4ff;padding:15px;display:flex;justify-content:space-between;}.header h1{color:#1a1a2e;margin:0;font-size:20px;}.container{max-width:800px;margin:0 auto;height:calc(100vh - 130px);overflow-y:auto;padding:20px;}.message{padding:15px;border-radius:15px;margin-bottom:10px;max-width:70%;}.sent{background:#00d4ff;color:#1a1a2e;margin-left:auto;}.received{background:#3a3a5e;}.msg-from{font-size:12px;opacity:0.7;margin-bottom:5px;}.msg-text{font-size:16px;}.msg-time{font-size:10px;opacity:0.5;text-align:right;margin-top:5px;}.input-area{display:flex;padding:15px;background:#2a2a4e;}.input-area input{flex:1;padding:15px;background:#1a1a2e;border:1px solid #444;border-radius:10px;color:#fff;margin-right:10px;}.input-area button{padding:15px 30px;background:#00d4ff;border:none;border-radius:10px;font-weight:bold;cursor:pointer;}</style></head><body><div class="header"><h1>💬 ${chatId}</h1><a href="/bot-chats/${botUsername}" style="color:#1a1a2e;text-decoration:none;padding:10px;background:rgba(0,0,0,0.1);border-radius:5px;">← Назад</a></div><div class="container">${messagesHtml||'<p style="opacity:0.5;text-align:center;">Нет сообщений</p>'}</div><div class="input-area"><input type="text" id="msgInput" placeholder="Сообщение..."><button onclick="sendMsg()">📤</button></div><script>async function sendMsg(){const text=document.getElementById('msgInput').value;if(!text)return;await fetch('/api/bots/${botUsername}/send',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({chat_id:'${chatId}',text:text})});document.getElementById('msgInput').value='';location.reload();}setTimeout(()=>location.reload(),5000);</script></body></html>`);
+
+    res.send(`
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <meta charset="UTF-8">
+            <title>Чат ${chatId}</title>
+            <style>
+                body { font-family: Arial; background: #1a1a2e; color: #eee; margin: 0; }
+                .header { background: #00d4ff; padding: 15px; display: flex; justify-content: space-between; }
+                .header h1 { color: #1a1a2e; margin: 0; font-size: 20px; }
+                .container { max-width: 800px; margin: 0 auto; height: calc(100vh - 130px); overflow-y: auto; padding: 20px; }
+                .message { padding: 15px; border-radius: 15px; margin-bottom: 10px; max-width: 70%; }
+                .sent { background: #00d4ff; color: #1a1a2e; margin-left: auto; }
+                .received { background: #3a3a5e; }
+                .msg-from { font-size: 12px; opacity: 0.7; margin-bottom: 5px; }
+                .msg-text { font-size: 16px; }
+                .msg-time { font-size: 10px; opacity: 0.5; text-align: right; margin-top: 5px; }
+                .input-area { display: flex; padding: 15px; background: #2a2a4e; }
+                .input-area input { flex: 1; padding: 15px; background: #1a1a2e; border: 1px solid #444; border-radius: 10px; color: #fff; margin-right: 10px; }
+                .input-area button { padding: 15px 30px; background: #00d4ff; border: none; border-radius: 10px; font-weight: bold; cursor: pointer; }
+            </style>
+        </head>
+        <body>
+            <div class="header">
+                <h1>💬 ${chatId}</h1>
+                <a href="/bot-chats/${botUsername}" style="color:#1a1a2e;text-decoration:none;padding:10px;background:rgba(0,0,0,0.1);border-radius:5px;">← Назад</a>
+            </div>
+            <div class="container" id="messages">
+                ${messagesHtml || '<p style="opacity:0.5;text-align:center;">Нет сообщений</p>'}
+            </div>
+            <div class="input-area">
+                <input type="text" id="msgInput" placeholder="Сообщение...">
+                <button onclick="sendMsg()">📤</button>
+            </div>
+            <script>
+                async function sendMsg() {
+                    const text = document.getElementById('msgInput').value;
+                    if (!text) return;
+                    await fetch('/api/bots/${botUsername}/send', {
+                        method: 'POST',
+                        headers: {'Content-Type': 'application/json'},
+                        body: JSON.stringify({chat_id: '${chatId}', text: text})
+                    });
+                    document.getElementById('msgInput').value = '';
+                    location.reload();
+                }
+                setTimeout(() => location.reload(), 5000);
+            </script>
+        </body>
+        </html>
+    `);
 });
 
 // ============ API ============
-app.post('/fetch', (req, res) => { res.status(202).json({ status: 'queued' }); });
-app.get('/result', (req, res) => { res.json({ status: 'processing' }); });
+app.post('/fetch', (req, res) => {
+    const { task_id, target_url } = req.body;
+    log('[API] /fetch: ' + task_id);
+    res.status(202).json({ status: 'queued', task_id });
+});
+
+app.get('/result', (req, res) => {
+    res.json({ status: 'processing' });
+});
 
 app.get('/api/bots', apiAuth, (req, res) => {
     const username = req.session.user?.username || 'admin';
-    res.json({ bots: users[username]?.bots || [] });
+    const user = users[username];
+    log('[API] GET /api/bots');
+    res.json({ bots: user?.bots || [] });
 });
 
 app.post('/api/bots/register', apiAuth, (req, res) => {
     const username = req.session.user?.username || 'admin';
     const { bot_username, bot_token } = req.body;
+
+    log('[API] POST /api/bots/register: @' + bot_username);
+
     if (!users[username].bots) users[username].bots = [];
+
     const exists = users[username].bots.find(b => b.username === bot_username);
-    if (exists) return res.json({ success: true, bot_username, status: 'already_exists' });
-    users[username].bots.push({ username: bot_username, token: bot_token, added_at: new Date().toISOString() });
+    if (exists) {
+        return res.json({ success: true, bot_username, status: 'already_exists' });
+    }
+
+    users[username].bots.push({
+        username: bot_username,
+        token: bot_token,
+        added_at: new Date().toISOString()
+    });
     saveUsers();
+
     res.json({ success: true, bot_username });
 });
 
 app.delete('/api/bots/:botUsername', apiAuth, (req, res) => {
     const username = req.session.user?.username || 'admin';
-    users[username].bots = (users[username].bots || []).filter(b => b.username !== req.params.botUsername);
+    const { botUsername } = req.params;
+
+    log('[API] DELETE /api/bots/' + botUsername);
+
+    users[username].bots = (users[username].bots || []).filter(b => b.username !== botUsername);
     saveUsers();
+
     res.json({ success: true });
 });
 
 app.get('/api/bots/:botUsername/chats', apiAuth, async (req, res) => {
-    try { res.json({ chats: await botManager.getBotChats(req.params.botUsername) }); }
-    catch (e) { res.json({ chats: [] }); }
+    const { botUsername } = req.params;
+    log('[API] GET /api/bots/' + botUsername + '/chats');
+
+    try {
+        const chats = await botManager.getBotChats(botUsername);
+        res.json({ chats });
+    } catch (e) {
+        log('[API] Error: ' + e.message, 'ERROR');
+        res.json({ chats: [] });
+    }
 });
 
 app.get('/api/bots/:botUsername/chats/:chatId/messages', apiAuth, async (req, res) => {
-    try { res.json({ messages: await botManager.getChatMessages(req.params.botUsername, req.params.chatId) }); }
-    catch (e) { res.json({ messages: [] }); }
+    const { botUsername, chatId } = req.params;
+    log('[API] GET /api/bots/' + botUsername + '/chats/' + chatId + '/messages');
+
+    try {
+        const messages = await botManager.getChatMessages(botUsername, chatId);
+        res.json({ messages });
+    } catch (e) {
+        log('[API] Error: ' + e.message, 'ERROR');
+        res.json({ messages: [] });
+    }
 });
 
 app.post('/api/bots/:botUsername/send', apiAuth, async (req, res) => {
+    const { botUsername } = req.params;
+    const { chat_id, text } = req.body;
+
+    log('[API] POST /api/bots/' + botUsername + '/send to ' + chat_id + ': ' + text?.substring(0, 50));
+
     try {
-        const result = await botManager.sendMessage(req.params.botUsername, req.body.chat_id, req.body.text);
+        const result = await botManager.sendMessage(botUsername, chat_id, text);
         res.json(result);
     } catch (e) {
+        log('[API] Send error: ' + e.message, 'ERROR');
         res.status(500).json({ error: e.message });
     }
 });
 
 app.get('/logs', requireAuth, (req, res) => {
-    let html = '<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Логи</title><style>body{font-family:monospace;background:#1a1a2e;color:#0f0;padding:20px;}a{color:#00d4ff;}pre{background:#0d0d1a;padding:20px;border-radius:10px;max-height:80vh;overflow-y:auto;}</style></head><body><a href="/dashboard">← Назад</a><a href="/logs" style="float:right;">🔄 Обновить</a><h1>📋 Логи</h1><pre>';
+    let html = '<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Логи</title><style>body{font-family:monospace;background:#1a1a2e;color:#0f0;padding:20px;}a{color:#00d4ff;}pre{background:#0d0d1a;padding:20px;border-radius:10px;max-height:80vh;overflow-y:auto;}</style></head><body><a href="/dashboard">← Назад</a><a href="/logs" style="float:right;">🔄 Обновить</a><h1>📋 Логи</h1><pre>';
     logs.slice().reverse().forEach(l => html += l + '\n');
     html += '</pre></body></html>';
     res.send(html);
@@ -559,10 +986,15 @@ app.get('/', (req, res) => {
     res.redirect('/login');
 });
 
+// ============ ЗАПУСК ============
 app.listen(PORT, () => {
     log('=== Server running on port ' + PORT + ' ===');
     log('=== Login: admin / admin123 ===');
+    log('=== Browser: /view/:id ===');
+    log('=== Bots: /api/bots?token=... ===');
     log('=== Bot commands: /start, /help, /status ===');
 });
 
+// Запускаем все фоновые процессы
+workerLoop().catch(e => log('[Worker] Fatal: ' + e.message));
 botPollerLoop().catch(e => log('[Bot Poller] Fatal: ' + e.message));
