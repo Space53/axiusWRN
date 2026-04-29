@@ -20,19 +20,18 @@ const YANDEX_TOKEN = process.env.YANDEX_TOKEN || '';
 const TASK_FOLDER = 'app:/tasks';
 const BOT_FOLDER = 'app:/bots';
 
-// ============ ЛОГИ ============
 const logs = [];
 function log(msg, level = 'INFO') {
     const entry = `[${new Date().toISOString()}] [${level}] ${msg}`;
     console.log(entry);
     logs.push(entry);
-    if (logs.length > 200) logs.shift();
+    if (logs.length > 300) logs.shift();
 }
 
 log('=== Axius WRN Server Starting ===');
 log('TOKEN: ' + (YANDEX_TOKEN ? 'SET' : 'NOT SET'));
+log('Bot API: ' + (YANDEX_TOKEN ? 'ENABLED' : 'DISABLED (no token)'));
 
-// ============ ПОЛЬЗОВАТЕЛИ ============
 const usersFile = '/tmp/users.json';
 let users = {};
 if (fs.existsSync(usersFile)) {
@@ -67,7 +66,6 @@ function saveUsers() {
     }
 }
 
-// ============ YANDEX DISK API ============
 class YandexDisk {
     constructor(token) {
         this.token = token;
@@ -124,7 +122,6 @@ class YandexDisk {
 
 const disk = new YandexDisk(YANDEX_TOKEN);
 
-// ============ TELEGRAM BOT MANAGER ============
 class TelegramBotManager {
     constructor(disk) {
         this.disk = disk;
@@ -147,11 +144,6 @@ class TelegramBotManager {
 
         log(`[Bot] Registered @${botUsername} for ${username}`);
         return { success: true, bot_username: botUsername };
-    }
-
-    async getUserBots(username) {
-        const user = users[username];
-        return (user && user.bots) ? user.bots : [];
     }
 
     async getBotChats(botUsername) {
@@ -190,21 +182,26 @@ class TelegramBotManager {
     }
 
     async sendMessage(botUsername, chatId, text) {
+        let botToken = '';
+        
         const tokenFile = `${BOT_FOLDER}/${botUsername}/token.txt`;
-        let botToken;
         try {
             botToken = (await this.disk.readFile(tokenFile)).toString().trim();
         } catch (e) {
-            // Если токена нет на диске, ищем в пользователях
-            const username = users['admin']?.username || 'admin';
-            const user = users[username];
-            const bot = (user?.bots || []).find(b => b.username === botUsername);
-            if (bot && bot.token) {
-                botToken = bot.token;
-            } else {
-                throw new Error('Bot token not found');
+            for (const username in users) {
+                const bot = (users[username].bots || []).find(b => b.username === botUsername);
+                if (bot && bot.token) {
+                    botToken = bot.token;
+                    break;
+                }
             }
         }
+
+        if (!botToken) {
+            throw new Error('Bot token not found');
+        }
+
+        log(`[Bot] Sending message via @${botUsername} to ${chatId}: ${text.substring(0, 50)}`);
 
         const response = await axios.post(
             `https://api.telegram.org/bot${botToken}/sendMessage`,
@@ -223,8 +220,11 @@ class TelegramBotManager {
         const notifPath = `${BOT_FOLDER}/${botUsername}/chats/@${chatId}/notifications/notif_${Date.now()}.json`;
         try {
             await this.disk.writeFile(notifPath, Buffer.from(JSON.stringify(notification, null, 2)));
-        } catch (e) {}
+        } catch (e) {
+            log(`[Bot] Failed to save notification: ${e.message}`, 'WARN');
+        }
 
+        log(`[Bot] Message sent, ID: ${response.data.result.message_id}`);
         return { success: true, message_id: response.data.result.message_id };
     }
 
@@ -244,16 +244,31 @@ class TelegramBotManager {
 
 const botManager = new TelegramBotManager(disk);
 
-// ============ MIDDLEWARE ============
 function requireAuth(req, res, next) {
-    if (req.session.user) {
-        next();
-    } else {
-        res.redirect('/login');
+    if (req.session.user) return next();
+    
+    const token = req.query.token || req.body.token;
+    if (token && token === YANDEX_TOKEN) {
+        req.session.user = { username: 'admin' };
+        return next();
     }
+    
+    res.redirect('/login');
 }
 
-// ============ АВТОРИЗАЦИЯ ============
+function apiAuth(req, res, next) {
+    if (req.session.user) return next();
+    
+    const token = req.query.token || req.body.token;
+    if (token && token === YANDEX_TOKEN) {
+        req.session.user = { username: 'admin' };
+        return next();
+    }
+    
+    log(`[API] Unauthorized request: ${req.originalUrl}`, 'WARN');
+    res.status(401).json({ error: 'Unauthorized' });
+}
+
 app.get('/login', (req, res) => {
     if (req.session.user) return res.redirect('/dashboard');
     
@@ -350,7 +365,6 @@ app.get('/logout', (req, res) => {
     res.redirect('/login');
 });
 
-// ============ ДАШБОРД ============
 app.get('/dashboard', requireAuth, (req, res) => {
     const username = req.session.user.username;
     const user = users[username];
@@ -502,7 +516,6 @@ app.get('/browser', async (req, res) => {
     }
 });
 
-// ============ СТРАНИЦЫ БОТОВ ============
 app.get('/bot-chats/:botUsername', requireAuth, async (req, res) => {
     const { botUsername } = req.params;
     const username = req.session.user.username;
@@ -638,7 +651,6 @@ app.get('/bot-chat/:botUsername/:chatId', requireAuth, async (req, res) => {
     `);
 });
 
-// ============ API ============
 app.post('/fetch', (req, res) => {
     res.status(202).json({ status: 'queued' });
 });
@@ -647,15 +659,18 @@ app.get('/result', (req, res) => {
     res.json({ status: 'processing' });
 });
 
-app.get('/api/bots', requireAuth, (req, res) => {
-    const username = req.session.user.username;
+app.get('/api/bots', apiAuth, (req, res) => {
+    const username = req.session.user?.username || 'admin';
     const user = users[username];
+    log('[API] GET /api/bots');
     res.json({ bots: user?.bots || [] });
 });
 
-app.post('/api/bots/register', requireAuth, (req, res) => {
-    const username = req.session.user.username;
+app.post('/api/bots/register', apiAuth, (req, res) => {
+    const username = req.session.user?.username || 'admin';
     const { bot_username, bot_token } = req.body;
+    
+    log('[API] POST /api/bots/register: @' + bot_username);
     
     if (!users[username].bots) users[username].bots = [];
     
@@ -674,9 +689,11 @@ app.post('/api/bots/register', requireAuth, (req, res) => {
     res.json({ success: true, bot_username });
 });
 
-app.delete('/api/bots/:botUsername', requireAuth, (req, res) => {
-    const username = req.session.user.username;
+app.delete('/api/bots/:botUsername', apiAuth, (req, res) => {
+    const username = req.session.user?.username || 'admin';
     const { botUsername } = req.params;
+    
+    log('[API] DELETE /api/bots/' + botUsername);
     
     users[username].bots = (users[username].bots || []).filter(b => b.username !== botUsername);
     saveUsers();
@@ -684,41 +701,51 @@ app.delete('/api/bots/:botUsername', requireAuth, (req, res) => {
     res.json({ success: true });
 });
 
-app.get('/api/bots/:botUsername/chats', requireAuth, async (req, res) => {
+app.get('/api/bots/:botUsername/chats', apiAuth, async (req, res) => {
     const { botUsername } = req.params;
+    log('[API] GET /api/bots/' + botUsername + '/chats');
+    
     try {
         const chats = await botManager.getBotChats(botUsername);
         res.json({ chats });
     } catch (e) {
+        log('[API] Error: ' + e.message, 'ERROR');
         res.json({ chats: [] });
     }
 });
 
-app.get('/api/bots/:botUsername/chats/:chatId/messages', requireAuth, async (req, res) => {
+app.get('/api/bots/:botUsername/chats/:chatId/messages', apiAuth, async (req, res) => {
     const { botUsername, chatId } = req.params;
+    log('[API] GET /api/bots/' + botUsername + '/chats/' + chatId + '/messages');
+    
     try {
         const messages = await botManager.getChatMessages(botUsername, chatId);
         res.json({ messages });
     } catch (e) {
+        log('[API] Error: ' + e.message, 'ERROR');
         res.json({ messages: [] });
     }
 });
 
-app.post('/api/bots/:botUsername/send', requireAuth, async (req, res) => {
+app.post('/api/bots/:botUsername/send', apiAuth, async (req, res) => {
     const { botUsername } = req.params;
     const { chat_id, text } = req.body;
+    
+    log('[API] POST /api/bots/' + botUsername + '/send to ' + chat_id + ': ' + text?.substring(0, 50));
+    
     try {
         const result = await botManager.sendMessage(botUsername, chat_id, text);
         res.json(result);
     } catch (e) {
+        log('[API] Send error: ' + e.message, 'ERROR');
         res.status(500).json({ error: e.message });
     }
 });
 
 app.get('/logs', requireAuth, (req, res) => {
-    let html = '<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Логи</title><style>body{font-family:monospace;background:#1a1a2e;color:#0f0;padding:20px;}a{color:#00d4ff;}pre{background:#0d0d1a;padding:20px;border-radius:10px;}</style></head><body><a href="/dashboard">← Назад</a><h1>📋 Логи</h1><pre>';
+    let html = '<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Логи</title><style>body{font-family:monospace;background:#1a1a2e;color:#0f0;padding:20px;}a{color:#00d4ff;}pre{background:#0d0d1a;padding:20px;border-radius:10px;max-height:80vh;overflow-y:auto;}</style></head><body><a href="/dashboard">← Назад</a><a href="/logs" style="float:right;">🔄 Обновить</a><h1>📋 Логи (' + logs.length + ')</h1><pre>';
     logs.slice().reverse().forEach(l => html += l + '\n');
-    html += '</pre></body></html>';
+    html += '</pre><script>setTimeout(()=>location.reload(),5000);</script></body></html>';
     res.send(html);
 });
 
@@ -730,4 +757,5 @@ app.get('/', (req, res) => {
 app.listen(PORT, () => {
     log('=== Server running on port ' + PORT + ' ===');
     log('=== Login: admin / admin123 ===');
+    log('=== API: /api/bots?token=YOUR_YANDEX_TOKEN ===');
 });
